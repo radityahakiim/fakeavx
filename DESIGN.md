@@ -434,6 +434,26 @@ the same line format the `cpuid_site` parameter accepts, which is all the
 persistence there is: a systemd unit saves it and writes it back at boot.
 AVX is reported only to files seen executing VEX-encoded instructions.
 
+**Short-patch windows and the heap (found with fakeavx-prof on the T61).**
+A 3-4 byte instruction's stub must sit in a window fixed by the bytes after
+it; for a following byte 0x00-0x7f (REX 0x48, prefix 0x66, ...) that is up to
+2 GB above the program. The kernel randomizes the heap start up to 1 GB above
+the program (`arch_randomize_brk`), and code-cache placement kept 1 GB clear
+above the heap, so whether such an instruction was patched or trapped on
+every execution (~1 us each) depended on ASLR: in QEMU, 6 of 10 runs of a
+test loop trapped, exactly those with the heap more than ~600 MB above the
+program. Windows now keep only 16 MB clear (`FA_HEAP_GAP_WINDOW`); code-cache
+regions, which can choose their place, keep 1 GB. A heap that later grows
+into a window makes brk() fail and malloc fall back to mmap().
+`stat_short_refused` counts windows that still cannot be had.
+
+**Legacy SSE4.1 inside regions.** On a host with SSE4.1, a legacy-encoded
+SSE4.1 instruction inside a region is copied as is (`do_native`, re-encoded
+only to fix an unreachable RIP-relative operand) and its xmm registers are
+accounted for exactly (plus xmm0 for the blendv forms), instead of going
+through the C helper and disabling register borrowing for the whole region.
+On SSSE3-only hosts, and for SSE4.2, the helper remains.
+
 **Policy.** Every process is handled by default (`policy=1`); `FAKEAVX=0` in
 the environment opts a program out.
 

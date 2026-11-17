@@ -1146,6 +1146,22 @@ static void fix_riprel(struct ctx *c, u16 avoid)
 	c->mem.disp = 0;
 }
 
+/*
+ * A legacy SSE4.1 instruction on a CPU that has SSE4.1. It only reaches the
+ * translator when it sits inside a region (on its own it never traps), and
+ * it runs as it is: it reads and writes only the low halves, which live in
+ * the host registers of the same number. Only a RIP-relative operand that
+ * the code cache cannot reach needs rewriting.
+ */
+static void do_native(struct ctx *c)
+{
+	const struct fa_insn *in = c->in;
+
+	fix_riprel(c, 0);
+	emit(c, 0x66, in->map, in->opcode, in->reg, is_mem(c) ? MEM(0) : REG(in->rm), in->W,
+	     in->has_imm ? in->imm : -1);
+}
+
 int fa_translate(const struct fa_insn *in, const struct fa_env *env)
 {
 	struct ctx ctx, *c = &ctx;
@@ -1167,7 +1183,12 @@ int fa_translate(const struct fa_insn *in, const struct fa_env *env)
 		return c->err ? -1 : (int)c->len;
 	}
 	if (in->kind == FA_K_SSE4) {
-		do_helper(c);
+		if (!env->no_sse41 && fa_is_sse41(in->map, in->opcode)) {
+			do_native(c);
+			finish(c);
+		} else {
+			do_helper(c);
+		}
 		return c->err ? -1 : (int)c->len;
 	}
 	if (in->kind != FA_K_VEX)

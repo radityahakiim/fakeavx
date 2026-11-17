@@ -665,7 +665,10 @@ static void test_spec(const struct spec *s, int iters)
 				if (!L && s->pp == 1 && s->map >= 2 && fa_is_sse41(s->map, s->opc) &&
 				    !(mp && ms >= 16 && ((u64)m.addr & 15))) {
 					encode(&e, s, 0, W, reg, 0, rm, mp, -1, 0, imm, &r, 1);
-					fails += run_one(s->name, &e, &r, dinit, rinit, s->fl | NX, 0xffff);
+					/* with SSE4.1 it is copied as is, so registers can be borrowed around it */
+					fails += run_one(s->name, &e, &r, dinit, rinit, s->fl | NX,
+							 getenv("FA_NOSSE41") ? 0xffff :
+							 (1u << reg) | (mp ? 0 : 1u << rm));
 				}
 			}
 		}
@@ -776,7 +779,10 @@ static void test_special(int iters)
 				r.gpr[3] = (u64)data + ((which && which < 6) ? rnd() % 8 : 0);
 			}
 			e.len = n;
-			fails += run_one(names[which], &e, &r, dinit, rinit, 0, 0xffff);
+			/* blendv (which >= 6) is SSE4.1: copied as is on SSE4.1 hosts; it reads xmm0 */
+			fails += run_one(names[which], &e, &r, dinit, rinit, 0,
+					 which >= 6 && !getenv("FA_NOSSE41") ?
+					 1u | (1u << xr) | (usemem ? 0 : 1u << xm) : 0xffff);
 		}
 	}
 }

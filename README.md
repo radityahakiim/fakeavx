@@ -31,6 +31,7 @@ touched at all.
 | `tools/fakeavx-cpuid` | Lists, saves and restores the known `cpuid` sites; manual registration. |
 | `scripts/` | Permanent installation: `install.sh`, `uninstall.sh`, systemd units. |
 | `tools/fakeavx-census` | Reports which instruction-set extensions a binary uses. |
+| `tools/prof/` | `fakeavx-prof`: per-instruction profiler and bit-exact verifier (below). |
 | `tests/difftest.c` | Differential test: every instruction form, native AVX vs. translation. Needs an AVX2 machine. |
 | `tests/regtest.c` | Region test: whole test functions run as translated regions vs. a C reference. Needs an AVX2 machine. |
 | `tests/intdec_check.py` | Checks the integer-instruction decoder against Capstone. |
@@ -94,7 +95,7 @@ Module parameters (`/etc/modprobe.d/fakeavx.conf`, or
 | `policy` | 1 | 1: every process unless it has `FAKEAVX=0`. 0: only processes started with `FAKEAVX=1`. |
 | `patch` | 1 | Overwrite translated instructions with a jump. 0 traps on every execution (slow; for debugging). |
 | `autocpuid` | 1 | Find a binary's `cpuid` instructions automatically (below). |
-| `stat_*` | — | Read-only counters, e.g. `stat_slow` (first-time traps), `stat_fast` (repeat traps), `stat_regions`, `stat_patched`, `stat_cpuid`, `stat_scans`, `stat_unsupported`. |
+| `stat_*` | — | Read-only counters, e.g. `stat_slow` (first-time traps), `stat_fast` (repeat traps), `stat_regions`, `stat_patched`, `stat_cpuid`, `stat_scans`, `stat_unsupported`, `stat_short_refused` (3-4 byte instructions left trapping because their stub window was unavailable). |
 
 `stat_fast` is the number to watch: every count is a full kernel round trip.
 If it keeps climbing while a program runs, that program has hot instructions
@@ -158,6 +159,56 @@ make guest
 tests/guest/guest_test      # AVX2 + POPCNT workload, threads, fork
 tests/guest/cpuid_test      # CPUID answers + SSE4.2 (run it twice the first time)
 ```
+
+## Profiling: which instructions are slow
+
+`fakeavx-prof` measures every supported instruction form (about 200, in
+`tools/prof/prof_tests.h`) the way a hot loop in a real program runs it, and
+shows what fakeavx turned it into, so that the expensive ones can be found
+and reduced.
+
+```sh
+make prof
+tools/prof/fakeavx-prof -s                     # all tests, slowest first
+tools/prof/fakeavx-prof -v -f gather,vdpps     # details for some tests
+tools/prof/fakeavx-prof -n                     # translations only, no timing (any machine)
+tools/prof/fakeavx-prof -c > prof.csv          # for a spreadsheet
+tools/prof/fakeavx-prof --check tools/prof/golden.txt   # bit-exact check against real AVX2
+```
+
+For precise numbers set the performance governor first
+(`sudo cpupower frequency-set -g performance`) and close other programs. The
+profiler pins itself to one CPU, interleaves every sample with an empty loop,
+and reports the median of the differences and its spread (MAD). It reads
+core cycles and retired instructions from perf counters when allowed
+(`kernel.perf_event_paranoid` ≤ 2), and otherwise uses the TSC.
+
+| Column | Meaning |
+|---|---|
+| `path` | `native` (this CPU has it), `inline` (translated to SSE), `helper` (calls C code in the helper blob: usually the slow ones), `kernel` (XGETBV, emulated on every execution by design), `TRAPS` (not patched, traps every time: a bug or a limitation worth reporting), `UNSUPP`, `FAULT` |
+| `cyc/u`, `ns/u` | cost of one unit (usually one instruction) in a loop |
+| `ins/u` | host instructions actually retired per unit, including inside helpers |
+| `L:cov` | how much of the loop its region covers; `all` means the loop runs entirely in the code cache. Less than that means legacy SSE (or another instruction a region cannot carry) splits it, and each AVX instruction enters and leaves the cache on its own |
+| `L:insns` | host instructions the translation runs per unit inside the loop |
+| `first-us` | first execution: trap, translation and patching |
+| `traps` | traps while measuring; should be 0 except for `kernel` |
+| `check` | result of `--check` |
+
+`-v` adds, per test, the instruction bytes, the decoding, the translation
+alone and inside its loop region (registers borrowed, helper calls), the
+module's counters for the first call and while measuring, and the timing
+details; `-vv` adds every sample and a hex dump of the translation. `-D DIR`
+writes the translations to files: disassemble them with
+`objdump -D -b binary -m i386:x86-64 DIR/<test>.region.bin`.
+
+The `ref_*` tests are native SSE instructions, for comparison; the `mix_*`
+tests put an AVX instruction and a legacy SSE instruction in one loop, as in
+programs that are mostly SSE. `--merom` / `--penryn` choose which CPU the
+static analysis assumes when it runs on a machine that has AVX.
+
+`tools/prof/golden.txt` holds the results of every test recorded on a CPU
+with real AVX2 (`--record`); `--check` compares bit for bit, register by
+register, and prints both values when they differ.
 
 ## What is implemented
 
@@ -251,5 +302,8 @@ and extra arguments are passed to `insmod` (e.g. `./run.sh patch=0`).
 | End-to-end on an SSSE3-only CPU model (`-cpu core2duo`) | QEMU | pass |
 | Automatic mode, automatic CPUID discovery, cache save/restore | QEMU, both CPU models | pass |
 | Bun and Claude Code (version before automatic mode) | ThinkPad T61 P8600 | reported working |
+| Short patches no longer depend on where ASLR puts the heap (10 runs, heap 114-913 MB above the program) | QEMU, `-cpu Penryn` | all patched, `stat_short_refused` 0 (before: 6 of 10 trapping) |
+| Legacy SSE4.1 inside regions runs natively; differential test with borrowed registers around it | development machine, QEMU | 1.18 M instances per mode, 0 mismatches |
+| `fakeavx-prof --check`: 198 instruction forms bit-exact against real AVX2 through the module | QEMU, `-cpu Penryn` and `-cpu core2duo` | 198/198 match, none trapping after translation |
 | `scripts/install.sh` (DKMS, systemd units) | — | **not run**: only the file layout was checked |
 | Automatic mode, SSSE3 support | real hardware | **not yet run** |

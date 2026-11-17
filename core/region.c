@@ -90,14 +90,23 @@ static int reachable(struct fa_rgn *r, u64 target)
 }
 
 /* xmm registers an instruction names; *wide: it works on 256-bit values */
-static u16 xmm_used(const struct fa_insn *in, int *wide)
+static u16 xmm_used(const struct fa_insn *in, int *wide, int no_sse41)
 {
 	const struct fa_op *op;
 	u16 m;
 
 	*wide = 0;
-	if (in->kind == FA_K_SSE4)
-		return 0xffff;	/* goes through the helper; keep it simple */
+	if (in->kind == FA_K_SSE4) {
+		if (no_sse41 || !fa_is_sse41(in->map, in->opcode))
+			return 0xffff;	/* goes through the helper; keep it simple */
+		/* runs natively (see do_native); rm may be a gpr: harmless */
+		m = 1 << in->reg;
+		if (in->mod == 3)
+			m |= 1 << in->rm;
+		if (in->map == 2 && (in->opcode == 0x10 || in->opcode == 0x14 || in->opcode == 0x15))
+			m |= 1;		/* pblendvb, blendvps, blendvpd: xmm0 */
+		return m;
+	}
 	if (in->kind != FA_K_VEX)
 		return 0;
 	op = fa_lookup(in->map, in->pp, in->opcode);
@@ -209,7 +218,7 @@ static void make_map(struct fa_rgn *r)
 
 		if (it->kind == FA_R_OURS) {
 			int wide;
-			u16 u = xmm_used(&it->in, &wide);
+			u16 u = xmm_used(&it->in, &wide, r->no_sse41);
 
 			used |= u;
 			if (wide)

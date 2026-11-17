@@ -75,7 +75,8 @@ module_param(force, bool, 0444);
 MODULE_PARM_DESC(force, "load even if the CPU already supports AVX (for testing only)");
 
 static unsigned long stat_fast, stat_slow, stat_translated, stat_patched, stat_patched_short,
-	stat_patched_int, stat_regions, stat_regions_borrowing, stat_unsupported;
+	stat_patched_int, stat_regions, stat_regions_borrowing, stat_unsupported,
+	stat_short_refused;
 module_param(stat_fast, ulong, 0444);
 module_param(stat_slow, ulong, 0444);
 module_param(stat_translated, ulong, 0444);
@@ -85,6 +86,7 @@ module_param(stat_patched_int, ulong, 0444);
 module_param(stat_regions, ulong, 0444);
 module_param(stat_regions_borrowing, ulong, 0444);
 module_param(stat_unsupported, ulong, 0444);
+module_param(stat_short_refused, ulong, 0444);
 
 /* One translated guest instruction. stub == 0: known to be unsupported. */
 struct fa_tr {
@@ -498,12 +500,25 @@ static bool fa_near(unsigned long a, unsigned long b)
 	return d > -FA_NEAR && d < FA_NEAR;
 }
 
+/*
+ * Room left above the heap for it to grow. Code cache regions can be placed
+ * anywhere within reach, so they keep a wide berth. A short-patch window has
+ * no choice: its place is dictated by the bytes after the instruction, and
+ * the kernel puts the heap up to 1 GB above the program at random, so a
+ * 1 GB gap refused most windows above the program in some runs and none in
+ * others. If the heap ever grows into a window, brk() fails and malloc
+ * carries on with mmap().
+ */
+#define FA_HEAP_GAP		(1UL << 30)
+#define FA_HEAP_GAP_WINDOW	(16UL << 20)
+
 /* Keep clear of where the heap and the stack may still want to grow. */
-static bool fa_addr_ok(struct mm_struct *mm, unsigned long a, unsigned long size)
+static bool fa_addr_ok(struct mm_struct *mm, unsigned long a, unsigned long size,
+		       unsigned long heap_gap)
 {
 	if (a < (1UL << 20) || a + size > TASK_SIZE_MAX - PAGE_SIZE || a + size < a)
 		return false;
-	if (a + size > mm->start_brk && a < mm->brk + (1UL << 30))
+	if (a + size > mm->start_brk && a < mm->brk + heap_gap)
 		return false;
 	if (a + size > mm->start_stack - (1UL << 30) && a < mm->start_stack + (1UL << 20))
 		return false;
@@ -520,7 +535,7 @@ static struct fa_region *fa_region_map(struct fa_mm *fm, unsigned long addr,
 	if (fm->nregions >= FA_MAX_REGIONS)
 		return NULL;
 	if (addr) {
-		if (!fa_addr_ok(fm->mm, addr, size))
+		if (!fa_addr_ok(fm->mm, addr, size, blob ? FA_HEAP_GAP : FA_HEAP_GAP_WINDOW))
 			return NULL;
 		flags |= MAP_FIXED_NOREPLACE;
 	}
@@ -805,6 +820,8 @@ static struct fa_tr *fa_make_entry(struct fa_mm *fm, struct fa_region *main,
 		memcpy(&fixed, cur + it->len, 5 - it->len);
 		lo = ip + 5 + (long)(s32)(fixed << shift);
 		r = fa_window_get(fm, lo, lo + (1UL << shift), &addr);
+		if (!r)
+			stat_short_refused++;	/* will trap on every execution */
 	}
 	if (!r && !map) {
 		addr = target;		/* nothing to set up: enter the body directly */
