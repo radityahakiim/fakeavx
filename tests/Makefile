@@ -17,6 +17,7 @@ check: difftest fuzz regtest
 	./regtest
 	./difftest 300
 	FA_FAR=1 ./difftest 100
+	FA_NOSSE41=1 ./difftest 100
 	./fuzz 3000000
 clean:
 	rm -f difftest fuzz regtest

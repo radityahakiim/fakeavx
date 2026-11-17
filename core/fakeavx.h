@@ -51,7 +51,7 @@ enum fa_kind {
 	FA_K_VEX = 1,
 	FA_K_POPCNT,
 	FA_K_XGETBV,
-	FA_K_SSE42,	/* legacy-encoded pcmpgtq, crc32, pcmp[ei]str[im] */
+	FA_K_SSE4,	/* legacy-encoded SSE4.1 / SSE4.2 instruction */
 };
 
 struct fa_mem {
@@ -101,6 +101,7 @@ struct fa_env {
 	u64 blob_addr;		/* guest address of the helper blob       */
 	u8 no_jmp;		/* fall through instead of jumping back   */
 	const struct fa_regmap *map;	/* NULL: no borrowed registers    */
+	u8 no_sse41;		/* host has SSSE3 only: emit no SSE4.1    */
 };
 
 /*
@@ -175,6 +176,7 @@ struct fa_rgn {
 	u64 exit_thunk;		/* tests only: leave through this address */
 	u32 max_items;		/* 0: FA_RG_ITEMS */
 	u8 no_map;		/* do not borrow registers */
+	u8 no_sse41;		/* host has SSSE3 only */
 	/* out */
 	u32 len;		/* body length */
 	u32 n;
@@ -197,6 +199,9 @@ int fa_region_build(struct fa_rgn *r);
 
 /* Entry stub: borrow the map's registers, then jump to target. Returns length. */
 int fa_emit_entry(u8 *out, u64 at, const struct fa_regmap *map, u64 target);
+
+/* Length of the instruction at p (lendec.c): 1 for an invalid opcode, 0 if truncated. */
+int fa_insn_len(const u8 *p, u32 avail);
 
 /* ---- op table, shared with the helper blob and the tests ---- */
 
@@ -252,6 +257,9 @@ struct fa_op {
 };
 
 const struct fa_op *fa_lookup(u8 map, u8 pp, u8 opcode);
+
+/* Is (map 2 = 0F38 / 3 = 0F3A, opcode) an SSE4.1 operation (66 prefix)? */
+int fa_is_sse41(u8 map, u8 opcode);
 
 #endif /* !__ASSEMBLY__ */
 

@@ -28,7 +28,8 @@ touched at all.
 | `core/` | Decoders, instruction table, AVX→SSE translator and region builder. Plain C, no OS dependencies. |
 | `helpers/` | User-mode helper blob (gathers, variable shifts, permutes, masked moves, POPCNT). Mapped into each process. |
 | `kmod/` | The kernel module. |
-| `tools/fakeavx-cpuid` | Makes CPUID report the emulated features to one program. |
+| `tools/fakeavx-cpuid` | Lists, saves and restores the known `cpuid` sites; manual registration. |
+| `scripts/` | Permanent installation: `install.sh`, `uninstall.sh`, systemd units. |
 | `tools/fakeavx-census` | Reports which instruction-set extensions a binary uses. |
 | `tests/difftest.c` | Differential test: every instruction form, native AVX vs. translation. Needs an AVX2 machine. |
 | `tests/regtest.c` | Region test: whole test functions run as translated regions vs. a C reference. Needs an AVX2 machine. |
@@ -37,94 +38,125 @@ touched at all.
 | `tests/guest/` | End-to-end test program to run on the AVX-less machine. |
 | `tests/qemu/run.sh` | Boots a kernel in QEMU with a Penryn CPU model and runs the end-to-end test. |
 
-## Build and install (on the T61)
+## Supported CPUs
 
-Requirements: kernel headers for the running kernel (`linux-lts-headers`),
-gcc, make, binutils. The kernel needs `CONFIG_KPROBES` and
-`CONFIG_MMU_NOTIFIER` (both set in Arch kernels).
+Any x86-64 CPU with SSSE3 and without AVX: Core 2 Merom/Conroe/Kentsfield
+(SSSE3 only) and Penryn/Wolfdale/Yorkfield (SSE4.1). On an SSSE3-only CPU
+SSE4.1 is emulated as well, in C, so programs that lean on SSE4.1 run but
+slowly; on Penryn SSE4.1 runs natively.
+
+## Install
+
+Requirements: kernel headers for the running kernel (`linux-lts-headers` on
+Arch), gcc, make, binutils; `dkms` recommended. The kernel needs
+`CONFIG_KPROBES`, `CONFIG_MMU_NOTIFIER` and `CONFIG_UPROBES` (all set in Arch
+kernels).
 
 ```sh
-make -C helpers          # helper blob -> helpers/blob.h
-make -C kmod             # -> kmod/fakeavx.ko
-sudo insmod kmod/fakeavx.ko
+make                # helper blob + kernel module
+sudo make install   # permanent: loaded at every boot
 ```
 
-Then opt a program in through its environment (inherited by its children):
+`make install` (`scripts/install.sh`) sets up:
 
-```sh
-FAKEAVX=1 ./program-built-with-avx2
-```
+- the module, through DKMS if it is installed (rebuilt automatically for new
+  kernels), otherwise copied into `/lib/modules/$(uname -r)/updates` (re-run
+  after a kernel update);
+- `/etc/modules-load.d/fakeavx.conf` to load it at boot, and
+  `/etc/modprobe.d/fakeavx.conf` for options;
+- `fakeavx-cpuid` and `fakeavx-census` in `/usr/local/bin`;
+- `fakeavx.service`, which restores the list of known `cpuid` sites at boot and
+  saves it at shutdown, and `fakeavx-save.timer`, which also saves it hourly.
+  The list lives in `/var/cache/fakeavx/sites`.
 
-Module parameters (`insmod fakeavx.ko name=value`, or
+`sudo make uninstall` removes it all (`scripts/uninstall.sh --purge` also
+deletes the cache and the options file). To try the module without installing:
+`make load` / `make unload`.
+
+## Use
+
+Nothing to do: every process is handled. When a program executes an
+instruction the CPU does not have, it is translated instead of killed.
+
+Per program, through its environment:
+
+| | |
+|---|---|
+| `FAKEAVX=0` | leave this program alone (it gets SIGILL as on a bare system) |
+| `FAKEAVX=sse4` | never let CPUID report AVX to it |
+| `FAKEAVX=avx2` | always let CPUID report AVX and AVX2 to it |
+
+Module parameters (`/etc/modprobe.d/fakeavx.conf`, or
 `/sys/module/fakeavx/parameters/`):
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `policy` | 0 | 0: only processes with `FAKEAVX=1` in their environment. 1: every process. |
-| `patch` | 1 | Overwrite translated instructions with a jump. Set to 0 to trap on every execution (slow; for debugging). |
-| `stat_*` | — | Read-only counters: `stat_slow` (first-time traps), `stat_fast` (repeat traps), `stat_translated`, `stat_regions`, `stat_regions_borrowing`, `stat_patched`, `stat_patched_short`, `stat_patched_int`, `stat_cpuid`, `stat_unsupported`. |
-| `cpuid_site`, `cpuid_clear` | — | Write-only; used by `tools/fakeavx-cpuid`. |
+| `policy` | 1 | 1: every process unless it has `FAKEAVX=0`. 0: only processes started with `FAKEAVX=1`. |
+| `patch` | 1 | Overwrite translated instructions with a jump. 0 traps on every execution (slow; for debugging). |
+| `autocpuid` | 1 | Find a binary's `cpuid` instructions automatically (below). |
+| `stat_*` | — | Read-only counters, e.g. `stat_slow` (first-time traps), `stat_fast` (repeat traps), `stat_regions`, `stat_patched`, `stat_cpuid`, `stat_scans`, `stat_unsupported`. |
 
 `stat_fast` is the number to watch: every count is a full kernel round trip.
 If it keeps climbing while a program runs, that program has hot instructions
-that could not be patched (see limitations).
+that could not be patched (see limitations). Unsupported instructions are
+logged with their bytes: `dmesg | grep fakeavx`.
 
 ## CPUID
 
 Many programs ask CPUID before using an instruction set, and CPUID cannot be
-trapped on a Core 2. `tools/fakeavx-cpuid` finds the `cpuid` instructions of
-one binary (with `objdump`; cached under `~/.cache/fakeavx`) and registers
-them with the module, which then answers in the CPU's place for opted-in
-processes running that binary:
+trapped on a Core 2. The module therefore puts a probe on the `cpuid`
+instructions of the binaries that matter and answers in the CPU's place.
+
+This is automatic. The first time a binary executes an unsupported
+instruction, the module walks that file's code, finds its `cpuid`
+instructions (a few seconds for a 100 MB executable, once) and from then on
+answers them — for every process running that file, now and later. With the
+permanent installation the list survives reboots; a file that has changed
+since (an update) is simply scanned again.
+
+What CPUID is made to report:
+
+- SSE4.1, SSE4.2 and POPCNT: always.
+- AVX, AVX2 and OSXSAVE: only to a binary that has been seen executing AVX
+  instructions (it uses AVX whatever CPUID says), or with `FAKEAVX=avx2`. A
+  program that can choose is faster on its own SSE code than on translated
+  AVX, and AVX2 code paths in the wild usually also use BMI/FMA/LZCNT, which
+  are not emulated.
+
+Limits of the automatic way:
+
+- A program that asks CPUID *before* executing anything unsupported, and gives
+  up, fails on its very first run and works from the second. To avoid even
+  that: `fakeavx-cpuid add /path/to/program`.
+- A program that checks for AVX and refuses to run without it never executes
+  an AVX instruction, so it is never recognised as an AVX program: start it
+  with `FAKEAVX=avx2`, or mark it once with `fakeavx-cpuid avx /path/to/program`.
+- Only the binary in which the instruction was hit is covered, not the shared
+  libraries it loads (each is handled when one of *its* instructions traps).
+
+`fakeavx-cpuid list` shows what is known; see `fakeavx-cpuid` without
+arguments for the rest. `fakeavx-census FILE` reports which instruction-set
+extensions a binary uses, to see in advance whether fakeavx can run it.
+
+### Bun and Claude Code
+
+Reported working on a ThinkPad T61 (P8600): Bun, and Claude Code (a
+Bun-compiled executable). These are built for Nehalem — SSE4.2 and POPCNT in
+the main code, AVX only in code selected at run time — which is what the
+SSE4.2 emulation and the CPUID answers are for. A build that targets Haswell
+throughout cannot work: `lzcnt`/`tzcnt` silently execute as different
+instructions on a Core 2.
+
+Things to expect: JIT-compiled JavaScript that uses POPCNT or SSE4.2 traps on
+every execution (JIT memory is never patched), and these are non-PIE
+executables, so keep an eye on `stat_fast`.
+
+## Test programs
 
 ```sh
-tools/fakeavx-cpuid add /path/to/program     # once per module load; needs gawk, binutils
-FAKEAVX=1    /path/to/program                # CPUID reports SSE4.2 + POPCNT
-FAKEAVX=avx2 /path/to/program                # ... and AVX, AVX2, OSXSAVE
-```
-
-Use `FAKEAVX=1` unless the program really refuses to run without AVX: a
-program that can choose is faster on its own SSE code than on translated AVX,
-and AVX2 code paths in the wild usually also use BMI/FMA/LZCNT, which are not
-emulated. Only the registered binary is affected; shared libraries (glibc
-included) keep seeing the real CPUID unless you register them too. The kernel
-needs `CONFIG_UPROBES`.
-
-### Bun
-
-Bun's regular x64 build targets Haswell (AVX2 + BMI + LZCNT) and cannot work:
-`lzcnt`/`tzcnt` silently execute as different instructions on a Core 2. Use a
-build that needs only SSE4.2 (`bun-linux-x64-baseline`; the 1.4.4 release
-binary examined during development is of that kind: SSE4.2 and POPCNT in its
-main code, AVX only behind run-time checks). It checks CPUID at start-up and
-exits with "this CPU is missing SSE4.2 support" otherwise, so:
-
-```sh
-tools/fakeavx-cpuid add "$(readlink -f "$(command -v bun)")"
-FAKEAVX=1 bun --version
-```
-
-The same goes for programs compiled with Bun into a single executable, such
-as Claude Code: register the program's own binary
-(`tools/fakeavx-cpuid add "$(readlink -f "$(command -v claude)")"`). Claude
-Code 2.1.326 for linux-x64 was examined statically and has the same profile:
-29 million instructions, SSE4.2 and POPCNT in the main code, AVX and BMI only
-in run-time selected code.
-
-`tools/fakeavx-census FILE` prints such a profile for any binary, to see in
-advance whether fakeavx can run it.
-
-This has **not been tested with Bun itself** beyond seeing that start-up check
-fail without CPUID interception. Things to expect: JIT-compiled JavaScript
-that uses POPCNT or SSE4.2 traps on every execution (JIT memory is never
-patched), and Bun is a non-PIE executable, so check `stat_fast` and
-`dmesg | grep fakeavx` (unsupported instructions are logged with their bytes).
-
-To build the end-to-end test and run it on the machine itself:
-
-```sh
-make -C tests/guest
-FAKEAVX=1 tests/guest/guest_test
+make guest
+tests/guest/guest_test      # AVX2 + POPCNT workload, threads, fork
+tests/guest/cpuid_test      # CPUID answers + SSE4.2 (run it twice the first time)
 ```
 
 ## What is implemented
@@ -136,8 +168,10 @@ FAKEAVX=1 tests/guest/guest_test
 - POPCNT (16/32/64-bit, exact flags).
 - SSE4.2 in its legacy encoding: `pcmpgtq`, `crc32`, `pcmpestri`, `pcmpestrm`,
   `pcmpistri`, `pcmpistrm` (all control-byte variants). These go through the
-  out-of-line helper, so they are correct but not fast.
-- CPUID interception for chosen binaries (see below).
+  out-of-line helper, so they are correct but not fast, and they do not set
+  floating-point exception flags in MXCSR.
+- SSE4.1 (legacy and VEX encodings) on CPUs that only have SSSE3.
+- CPUID answering, with automatic discovery of the `cpuid` instructions.
 - `XGETBV` (reports AVX state as enabled) when the kernel is booted with
   `noxsave`.
 - Per-thread state for the upper YMM halves, including new threads and `fork`.
@@ -212,6 +246,10 @@ and extra arguments are passed to `insmod` (e.g. `./run.sh patch=0`).
 | End-to-end (threads, fork, XGETBV, rmmod), PIE and non-PIE, `patch=0` | QEMU 10 TCG, `-cpu Penryn`, 4 CPUs, Linux 6.18.39 | pass, no kernel warnings |
 | End-to-end, per-instruction version (before regions) | ThinkPad T61, Arch 6.18.39-lts | pass, `stat_fast` 0, 209 ms |
 | End-to-end, region version | ThinkPad T61 | pass, `stat_fast` 0, 183 ms, 6 of 11 regions borrowing |
-| CPUID interception + SSE4.2 (`tests/guest/cpuid_test`, both modes) | QEMU Penryn VM | pass |
-| CPUID interception + SSE4.2 | ThinkPad T61 | **not yet run** |
-| Bun | — | **not run** |
+| Differential test in SSSE3-host mode, and legacy SSE4.1 encodings | development machine | 0 mismatches |
+| In-kernel `cpuid` scanner vs. objdump (5 binaries incl. Bun, Claude Code) | development machine | identical site lists |
+| End-to-end on an SSSE3-only CPU model (`-cpu core2duo`) | QEMU | pass |
+| Automatic mode, automatic CPUID discovery, cache save/restore | QEMU, both CPU models | pass |
+| Bun and Claude Code (version before automatic mode) | ThinkPad T61 P8600 | reported working |
+| `scripts/install.sh` (DKMS, systemd units) | — | **not run**: only the file layout was checked |
+| Automatic mode, SSSE3 support | real hardware | **not yet run** |

@@ -769,7 +769,14 @@ static void do_bcast(struct ctx *c)
 			emit(c, 0xf3, 1, 0x7e, D, MEM(0), 0, -1);	/* movq */
 			break;
 		case 0x78:
-			emit(c, 0x66, 3, 0x20, D, MEM(0), 0, 0);	/* pinsrb */
+			if (c->env->no_sse41) {
+				int g = gscratch(c, 0);
+
+				emit(c, 0, 1, 0xb6, g, MEM(0), 0, -1);		/* movzx g, byte */
+				emit(c, 0x66, 1, 0x6e, D, REG(g), 0, -1);	/* movd */
+			} else {
+				emit(c, 0x66, 3, 0x20, D, MEM(0), 0, 0);	/* pinsrb */
+			}
 			break;
 		default:
 			emit(c, 0x66, 1, 0xc4, D, MEM(0), 0, 0);	/* pinsrw */
@@ -1159,7 +1166,7 @@ int fa_translate(const struct fa_insn *in, const struct fa_env *env)
 		finish(c);
 		return c->err ? -1 : (int)c->len;
 	}
-	if (in->kind == FA_K_SSE42) {
+	if (in->kind == FA_K_SSE4) {
 		do_helper(c);
 		return c->err ? -1 : (int)c->len;
 	}
@@ -1205,6 +1212,18 @@ int fa_translate(const struct fa_insn *in, const struct fa_env *env)
 	if (o->shape == FA_S_BLENDV)
 		c->used |= 1 << (in->imm >> 4);
 
+	/* SSSE3-only host: anything that would need an SSE4.1 instruction */
+	if (env->no_sse41) {
+		if ((in->map == 2 || in->map == 3) && in->opcode != 0x2a &&
+		    (fa_is_sse41(in->map, in->opcode) || (in->map == 3 && in->opcode == 0x02))) {
+			do_helper(c);
+			return c->err ? -1 : (int)c->len;
+		}
+		if (in->map == 2 && in->opcode == 0x2a) {	/* movntdqa -> movdqa */
+			c->map = 1;
+			c->opc = 0x6f;
+		}
+	}
 	if (o->shape == FA_S_HELPER ||
 	    (o->shape == FA_S_PTEST && in->L)) {
 		do_helper(c);

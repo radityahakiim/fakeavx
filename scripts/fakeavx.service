@@ -1,0 +1,13 @@
+[Unit]
+Description=fakeavx: restore and save the list of known cpuid sites
+After=systemd-modules-load.service
+ConditionPathExists=/sys/module/fakeavx
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/fakeavx-cpuid restore
+ExecStop=/usr/local/bin/fakeavx-cpuid save
+
+[Install]
+WantedBy=multi-user.target

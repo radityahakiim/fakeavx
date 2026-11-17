@@ -49,8 +49,11 @@ helper_entry:
 	mov	%gs:FA_ST_SELF, %rcx
 	mov	%rsp, %rbp
 	and	$-16, %rsp
+	sub	$16, %rsp
+	stmxcsr	(%rsp)		/* C code must not leave marks in MXCSR */
 	cld
 	call	fa_helper_c
+	ldmxcsr	(%rsp)
 	mov	%rbp, %rsp
 	.irp n, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 	movaps	%gs:FA_ST_LO + 16 * \n, %xmm\n

@@ -1,0 +1,7 @@
+[Unit]
+Description=fakeavx: save the list of known cpuid sites
+ConditionPathExists=/sys/module/fakeavx
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/fakeavx-cpuid save

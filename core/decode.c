@@ -195,20 +195,22 @@ int fa_decode(const u8 *code, u32 avail, u64 rip, struct fa_insn *in)
 		in->len = n;
 		return 0;
 	}
-	/* SSE4.2, legacy encoding */
+	/* SSE4.1 and SSE4.2, legacy encoding */
 	if (!f3 && avail >= n + 4 && (code[n + 1] == 0x38 || code[n + 1] == 0x3a)) {
 		u8 esc = code[n + 1], opc = code[n + 2];
 		int ok;
 
 		if (esc == 0x38)
 			ok = (opc == 0x37 && p66 && !f2) ||		/* pcmpgtq */
-			     ((opc == 0xf0 || opc == 0xf1) && f2);	/* crc32 */
+			     ((opc == 0xf0 || opc == 0xf1) && f2) ||	/* crc32 */
+			     (p66 && !f2 && fa_is_sse41(2, opc));
 		else
-			ok = opc >= 0x60 && opc <= 0x63 && p66 && !f2;	/* pcmpXstrX */
+			ok = p66 && !f2 && ((opc >= 0x60 && opc <= 0x63) ||	/* pcmpXstrX */
+					    fa_is_sse41(3, opc));
 		if (!ok)
 			return -1;
 		n += 3;
-		in->kind = FA_K_SSE42;
+		in->kind = FA_K_SSE4;
 		in->map = esc == 0x38 ? 2 : 3;
 		in->pp = f2 ? 3 : 1;
 		in->opcode = opc;

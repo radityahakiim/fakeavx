@@ -2,7 +2,7 @@
 # Run a dynamically linked program inside the Penryn VM with fakeavx loaded.
 # The VM has no network device.
 #
-#   KERNEL=bzImage QEMU=qemu-system-x86_64 [SITES=file] [FAKEAVX=avx2] [EXTRA=files] \
+#   KERNEL=bzImage QEMU=qemu-system-x86_64 [CPU=core2duo] [RUNS=2] [SITES=file] [FAKEAVX=avx2] \
 #       ./run-app.sh /path/to/binary 'guest command line'
 #
 # The binary is copied to /app in the guest together with the host's glibc.
@@ -39,15 +39,18 @@ B=/bin/busybox
 \$B mount -t devtmpfs dev /dev 2>/dev/null
 \$B mkdir -p /dev/shm; \$B mount -t tmpfs tmpfs /dev/shm
 export HOME=/tmp PATH=/bin TMPDIR=/tmp
-for a in sh ls cat echo; do \$B ln -s busybox /bin/\$a; done
+\$B --install -s /bin
 \$B insmod /fakeavx.ko ${MODARGS:-} || echo "INSMOD FAILED"
 if [ -f /sites ]; then
 	n=0; while read off; do echo "\$off /app" > /sys/module/fakeavx/parameters/cpuid_site && n=\$((n+1)); done < /sites
 	echo "=== \$n cpuid sites registered"
 fi
 cd /tmp
-echo "=== run"
-FAKEAVX=${FAKEAVX:-1} $cmd; echo "exit status \$?"
+i=0; while [ \$i -lt ${RUNS:-1} ]; do i=\$((i+1))
+echo "=== run \$i"
+${FAKEAVX:+FAKEAVX=$FAKEAVX }$cmd; echo "exit status \$?"
+done
+echo "=== /proc/fakeavx/sites: \$(\$B grep -c . /proc/fakeavx/sites) lines"; \$B grep -v "^[0-9a-f]* " /proc/fakeavx/sites
 echo "=== stats"
 for f in /sys/module/fakeavx/parameters/stat_*; do echo "\$(\$B basename \$f) \$(\$B cat \$f)"; done
 \$B dmesg | \$B grep -i -E 'fakeavx|BUG|WARNING|Oops|sleeping|scheduling while|segfault|traps:' | \$B tail -25

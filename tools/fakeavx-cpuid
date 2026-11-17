@@ -1,19 +1,31 @@
 #!/bin/sh
-# fakeavx-cpuid - make CPUID report SSE4.2/POPCNT (and optionally AVX/AVX2) to
-# one program.
+# fakeavx-cpuid - manage the list of cpuid instructions fakeavx answers for.
 #
-# CPUID cannot be trapped on a Core 2, so the fakeavx module has to be told
-# where a binary's cpuid instructions are. This tool finds them with objdump
-# and registers them. Registration lasts until the module is unloaded.
+# Normally nothing here needs to be run by hand: the module finds a binary's
+# cpuid instructions by itself the first time that binary hits an unsupported
+# instruction, and an installed system saves and restores the list across
+# reboots (fakeavx.service).
 #
-#   fakeavx-cpuid add  FILE     find (or reuse cached) sites and register them
-#   fakeavx-cpuid scan FILE     only print the file offsets, one per line
-#   fakeavx-cpuid clear         drop all registered sites
+#   fakeavx-cpuid list            what the module currently knows
+#   fakeavx-cpuid add FILE        register FILE's cpuid instructions now, so that
+#                                 even its first run sees the emulated features
+#                                 (needs objdump and gawk)
+#   fakeavx-cpuid avx FILE        make CPUID report AVX/AVX2 to FILE
+#   fakeavx-cpuid scan FILE       only print the file offsets, one per line
+#   fakeavx-cpuid save [CACHE]    write the module's list to CACHE
+#   fakeavx-cpuid restore [CACHE] give a saved list back to the module; entries
+#                                 for files that changed since are dropped
+#   fakeavx-cpuid clear           make the module forget everything
 #
-# Afterwards run the program with FAKEAVX=1 (SSE4.2 + POPCNT reported) or
-# FAKEAVX=avx2 (AVX and AVX2 reported as well).
+# CACHE defaults to /var/cache/fakeavx/sites.
 set -e
 P=/sys/module/fakeavx/parameters
+PROC=/proc/fakeavx/sites
+CACHE=${2:-/var/cache/fakeavx/sites}
+
+need_module() {
+	[ -d "$P" ] || { echo "the fakeavx module is not loaded" >&2; exit 1; }
+}
 
 scan() {
 	f=$1
@@ -45,34 +57,72 @@ write_param() {	# name value
 }
 
 case "$1" in
+list)
+	need_module
+	awk '
+	$1 == "scanned" { sub(/^[^ ]+ /, ""); seen[$0] = 1; next }
+	$1 == "avx" { sub(/^[^ ]+ /, ""); seen[$0] = 1; avx[$0] = 1; next }
+	{ sub(/^[^ ]+ /, ""); seen[$0] = 1; n[$0]++ }
+	END { for (p in seen) printf "%5d cpuid sites%s  %s\n", n[p], avx[p] ? ", reports AVX" : "", p }' "$PROC"
+	;;
 scan)
 	[ -f "$2" ] || { echo "usage: $0 scan FILE" >&2; exit 1; }
 	scan "$2"
 	;;
 add)
 	[ -f "$2" ] || { echo "usage: $0 add FILE" >&2; exit 1; }
-	[ -d "$P" ] || { echo "the fakeavx module is not loaded" >&2; exit 1; }
+	need_module
 	f=$(readlink -f "$2")
-	cache=${XDG_CACHE_HOME:-$HOME/.cache}/fakeavx
-	mkdir -p "$cache"
-	key=$cache/$(basename "$f").$(stat -c '%s.%Y' "$f").sites
-	if [ ! -s "$key" ]; then
-		echo "scanning $f for cpuid instructions (slow for big binaries, cached afterwards)..." >&2
-		scan "$f" > "$key.tmp"
-		mv "$key.tmp" "$key"
-	fi
+	echo "scanning $f for cpuid instructions..." >&2
 	n=0
-	while read -r off; do
+	for off in $(scan "$f"); do
 		write_param cpuid_site "$off $f"
 		n=$((n + 1))
-	done < "$key"
+	done
+	write_param cpuid_site "scanned $f"
 	echo "$n cpuid sites registered for $f"
 	;;
+avx)
+	[ -f "$2" ] || { echo "usage: $0 avx FILE" >&2; exit 1; }
+	need_module
+	write_param cpuid_site "avx $(readlink -f "$2")"
+	;;
+save)
+	need_module
+	mkdir -p "$(dirname "$CACHE")"
+	{
+		# remember what each file looked like, to notice later if it changed
+		sed 's/^[^ ]* //' "$PROC" | sort -u | while IFS= read -r p; do
+			[ -f "$p" ] && printf 'stat %s %s\n' "$(stat -c '%s.%Y' "$p")" "$p"
+		done
+		cat "$PROC"
+	} > "$CACHE.tmp"
+	mv "$CACHE.tmp" "$CACHE"
+	;;
+restore)
+	need_module
+	[ -f "$CACHE" ] || exit 0
+	valid=$(mktemp)
+	trap 'rm -f "$valid"' EXIT
+	while read -r kind sig path; do
+		[ "$kind" = stat ] || continue
+		[ -f "$path" ] && [ "$(stat -c '%s.%Y' "$path")" = "$sig" ] && printf '%s\n' "$path" >> "$valid"
+	done < "$CACHE"
+	n=0
+	while IFS= read -r line; do
+		case "$line" in stat\ *) continue ;; esac
+		if grep -Fxq -- "${line#* }" "$valid"; then
+			write_param cpuid_site "$line" && n=$((n + 1))
+		fi
+	done < "$CACHE"
+	echo "fakeavx: $n cached entries restored"
+	;;
 clear)
+	need_module
 	write_param cpuid_clear 1
 	;;
 *)
-	sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+	sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
 	exit 1
 	;;
 esac

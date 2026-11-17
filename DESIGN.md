@@ -343,7 +343,7 @@ tests/     differential harness, decoder fuzzer, QEMU integration scripts
 
 ## 15. Implementation notes (what changed while building it)
 
-**Scope.** Penryn only (SSE4.1 templates, no SSSE3 synthesis tier). FMA, F16C
+**Scope.** Penryn natively; SSSE3-only CPUs through C implementations of SSE4.1 (no synthesized templates). FMA, F16C
 and BMI are out: AVX/AVX2/POPCNT do not depend on them. Implemented: O1, O2,
 O3, O4 (within a region), O5, O8, O10. Not implemented: O6, O7, O9.
 
@@ -423,13 +423,27 @@ integer instruction of at least 5 bytes earlier in the same block is patched
 to enter the region instead, using the same three-step protocol with `C4` as
 the temporary trapping byte.
 
-**CPUID (§9).** Implemented with uprobes as planned: confirmed on 6.18.39
-that a uprobe handler runs in sleepable context and that changing `regs->ip`
-makes the kernel skip the probed instruction. Sites come from
-`tools/fakeavx-cpuid` (objdump-based) through a write-only module parameter.
-By default only SSE4.2 and POPCNT are added to the real answer; AVX/AVX2 are
-reported only to processes started with `FAKEAVX=avx2`. `XGETBV` is answered
-in the #UD slow path.
+**CPUID (§9).** Implemented with uprobes: confirmed on 6.18.39 that a uprobe
+handler runs in sleepable context and that changing `regs->ip` makes the
+kernel skip the probed instruction. Sites are found by the module itself: the
+#UD slow path notes which file the instruction belongs to and, once per file,
+walks its executable ELF segments with `core/lendec.c` (a length-only decoder;
+the kernel's `insn_decode()` is not exported). Its site lists are identical to
+objdump's on the binaries tried. `/proc/fakeavx/sites` exports the state in
+the same line format the `cpuid_site` parameter accepts, which is all the
+persistence there is: a systemd unit saves it and writes it back at boot.
+AVX is reported only to files seen executing VEX-encoded instructions.
+
+**Policy.** Every process is handled by default (`policy=1`); `FAKEAVX=0` in
+the environment opts a program out.
+
+**SSSE3-only hosts.** The helper blob is built without SSE4.1 and contains C
+implementations of the SSE4.1 operations. They serve two purposes: the legacy
+encodings (which raise #UD on Merom) and, when the host lacks SSE4.1, the
+VEX-encoded forms whose templates would have used an SSE4.1 instruction. One
+detail found by differential testing: `dpps` sums its products with a
+different operand order for each result element, visible only in which NaN
+payload survives.
 
 **SSE4.2.** Added because real "no AVX" builds (Bun's baseline build) target
 Nehalem. The legacy-encoded `pcmpgtq`, `crc32` and `pcmpXstrX` all raise #UD

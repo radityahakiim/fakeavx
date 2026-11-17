@@ -96,7 +96,7 @@ static u16 xmm_used(const struct fa_insn *in, int *wide)
 	u16 m;
 
 	*wide = 0;
-	if (in->kind == FA_K_SSE42)
+	if (in->kind == FA_K_SSE4)
 		return 0xffff;	/* goes through the helper; keep it simple */
 	if (in->kind != FA_K_VEX)
 		return 0;
@@ -125,6 +125,7 @@ static void discover(struct fa_rgn *r)
 	env.out_addr = r->out_addr;
 	env.blob_addr = r->blob_addr;
 	env.no_jmp = 1;
+	env.no_sse41 = r->no_sse41;
 
 	r->n = 0;
 	r->pend[np++] = r->entry_ip;
@@ -269,6 +270,7 @@ static int emit_body(struct fa_rgn *r)
 	env.blob_addr = r->blob_addr;
 	env.no_jmp = 1;
 	env.map = map;
+	env.no_sse41 = r->no_sse41;
 
 	for (i = 0; i < r->n; i++) {
 		struct fa_ritem *it = &r->it[i];

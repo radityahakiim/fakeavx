@@ -288,7 +288,7 @@ struct memop {
 /* build one VEX instruction; returns the offset of a rip-relative disp32 or -1 */
 static int encode(struct enc *e, const struct spec *s, int L, int W, int reg, int vvvv,
 		  int rmreg, const struct memop *m, int vsib_idx, int scale, int imm,
-		  struct regs *r)
+		  struct regs *r, int legacy)
 {
 	int n = 0, ripoff = -1;
 	int R = reg >> 3, X = 0, B = 0;
@@ -341,7 +341,14 @@ static int encode(struct enc *e, const struct spec *s, int L, int W, int reg, in
 		}
 	}
 
-	if (s->map == 1 && !X && !B && !W && (rnd() & 1)) {
+	if (legacy) {
+		/* 66 [REX] 0F 38/3A: the two-operand SSE4.1 form */
+		e->b[n++] = 0x66;
+		if (R || X || B || W)
+			e->b[n++] = 0x40 | (W << 3) | (R << 2) | (X << 1) | B;
+		e->b[n++] = 0x0f;
+		e->b[n++] = s->map == 2 ? 0x38 : 0x3a;
+	} else if (s->map == 1 && !X && !B && !W && (rnd() & 1)) {
 		e->b[n++] = 0xc5;
 		e->b[n++] = ((!R) << 7) | ((~vvvv & 15) << 3) | (L << 2) | s->pp;
 	} else {
@@ -433,6 +440,7 @@ static int run_one(const char *name, const struct enc *e, const struct regs *ini
 	env.out_addr = (u64)stub;
 	env.blob_addr = (u64)blobaddr;
 	env.no_jmp = rnd() & 1;
+	env.no_sse41 = !!getenv("FA_NOSSE41");
 	/*
 	 * Half of the time, pretend to be inside a region: registers the
 	 * instruction does not mention are borrowed to hold upper halves of
@@ -524,6 +532,8 @@ static int run_one(const char *name, const struct enc *e, const struct regs *ini
 		printf("    flags native %lx translated %lx\n",
 		       (unsigned long)a.flags & 0x8d5, (unsigned long)b.flags & 0x8d5);
 	}
+	if (env.no_sse41 && in.kind == FA_K_VEX && in.map >= 2)
+		fl |= NX;	/* the C implementations do not reproduce exception flags */
 	if (!(fl & NX) && a.mxcsr != b.mxcsr) {
 		if (!bad++) printf("FAIL %s\n", name);
 		printf("    mxcsr native %x translated %x\n", a.mxcsr, b.mxcsr);
@@ -644,12 +654,19 @@ static void test_spec(const struct spec *s, int iters)
 					}
 					mp = &m;
 				}
-				encode(&e, s, L, W, reg, vvvv, rm, mp, vs, scale, imm, &r);
+				encode(&e, s, L, W, reg, vvvv, rm, mp, vs, scale, imm, &r, 0);
 				fails += run_one(s->name, &e, &r, dinit, rinit, s->fl,
 						 (s->fl & (RG | MG | NM)) == (RG | MG | NM) ? 0xffff :
 						 (1u << reg) | (1u << vvvv) | (1u << rm) |
 						 ((s->fl & I4) ? 1u << (imm >> 4) : 0) |
 						 (vs >= 0 ? 1u << vs : 0));
+				/* the same operation in its legacy SSE4.1 encoding */
+				/* (legacy packed memory operands must be aligned) */
+				if (!L && s->pp == 1 && s->map >= 2 && fa_is_sse41(s->map, s->opc) &&
+				    !(mp && ms >= 16 && ((u64)m.addr & 15))) {
+					encode(&e, s, 0, W, reg, 0, rm, mp, -1, 0, imm, &r, 1);
+					fails += run_one(s->name, &e, &r, dinit, rinit, s->fl | NX, 0xffff);
+				}
 			}
 		}
 	}
@@ -702,8 +719,10 @@ static void test_special(int iters)
 		/* SSE4.2 in its legacy encoding: pcmpgtq, pcmpXstrX, crc32 */
 		{
 			static const char *names[] = { "pcmpgtq", "pcmpestrm", "pcmpestri",
-						       "pcmpistrm", "pcmpistri", "crc32" };
-			int which = rnd() % 6, xr = rnd() & 15, xm = rnd() & 15;
+						       "pcmpistrm", "pcmpistri", "crc32",
+						       "pblendvb", "blendvps", "blendvpd" };
+			static const u8 bv[] = { 0x10, 0x14, 0x15 };
+			int which = rnd() % 9, xr = rnd() & 15, xm = rnd() & 15;
 			int usemem = rnd() & 1, w = rnd() & 1, rex;
 
 			init_regs(&r);
@@ -748,13 +767,13 @@ static void test_special(int iters)
 				if (rex != 0x40)
 					e.b[n++] = rex;
 				e.b[n++] = 0x0f;
-				e.b[n++] = which ? 0x3a : 0x38;
-				e.b[n++] = which ? 0x60 + which - 1 : 0x37;
+				e.b[n++] = (which && which < 6) ? 0x3a : 0x38;
+				e.b[n++] = which >= 6 ? bv[which - 6] : which ? 0x60 + which - 1 : 0x37;
 				e.b[n++] = (usemem ? 0x00 : 0xc0) | ((xr & 7) << 3) | (usemem ? 3 : (xm & 7));
-				if (which)
+				if (which && which < 6)
 					e.b[n++] = rnd();
 				/* legacy pcmpgtq needs an aligned memory operand */
-				r.gpr[3] = (u64)data + (which ? rnd() % 8 : 0);
+				r.gpr[3] = (u64)data + ((which && which < 6) ? rnd() % 8 : 0);
 			}
 			e.len = n;
 			fails += run_one(names[which], &e, &r, dinit, rinit, 0, 0xffff);

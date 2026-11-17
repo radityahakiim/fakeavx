@@ -37,6 +37,10 @@
 #include <linux/namei.h>
 #include <linux/fs.h>
 #include <asm/cpuid/api.h>
+#include <linux/elf.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
+#include <linux/file.h>
 #include <asm/trapnr.h>
 #include <asm/msr.h>
 #include <asm/cpufeature.h>
@@ -52,9 +56,15 @@
 #define FA_MAX_REGIONS	2048
 #define FA_BODY_MAX	16384			/* translated code of one region */
 
-static int policy;
+static int policy = 1;
 module_param(policy, int, 0644);
-MODULE_PARM_DESC(policy, "0: only processes with FAKEAVX=1 in their environment (default), 1: all processes");
+MODULE_PARM_DESC(policy, "1: every process, unless it has FAKEAVX=0 in its environment (default); 0: only processes with FAKEAVX=1");
+
+static bool autocpuid = true;
+module_param(autocpuid, bool, 0644);
+MODULE_PARM_DESC(autocpuid, "find the cpuid instructions of a binary by itself the first time it hits an unsupported instruction (default on)");
+
+static bool no_sse41;	/* host has SSSE3 but not SSE4.1 */
 
 static bool patch = true;
 module_param(patch, bool, 0644);
@@ -103,7 +113,7 @@ struct fa_mm {
 	struct mmu_notifier mn;
 	unsigned long dead;
 	bool enabled;
-	bool cpuid_avx;			/* CPUID also reports AVX/AVX2 */
+	u8 cpuid_mode;			/* 0: per binary, 1: never report AVX, 2: always */
 	struct mutex lock;		/* translation, regions, patching */
 	struct xarray tr;		/* guest rip -> struct fa_tr */
 	struct list_head regions;
@@ -123,6 +133,8 @@ static DEFINE_SPINLOCK(fa_mms_lock);
 static DEFINE_MUTEX(fa_create_lock);
 static struct workqueue_struct *fa_wq;
 static atomic_t fa_inflight;
+
+static void fa_note_file(unsigned long ip, bool vex);
 
 /* ------------------------------------------------------------------ */
 /* user GS base                                                        */
@@ -202,13 +214,20 @@ static const struct mmu_notifier_ops fa_mn_ops = {
 };
 
 /*
- * How did the environment the process was exec'ed with opt in?
- * 0: not at all, 1: FAKEAVX=1, 2: FAKEAVX=avx2 (CPUID also reports AVX/AVX2).
+ * What does the environment the process was exec'ed with say?
+ *   FAKEAVX=0     -1  leave this process alone
+ *   (nothing)      0  up to the module's policy
+ *   FAKEAVX=1      1  handle it; CPUID reports AVX if the binary is known to use it
+ *   FAKEAVX=sse4   2  handle it; CPUID never reports AVX
+ *   FAKEAVX=avx2   3  handle it; CPUID always reports AVX and AVX2
  */
 static int fa_env_opt_in(struct mm_struct *mm)
 {
+	static const struct { const char *s; int v; } modes[] = {
+		{ "FAKEAVX=0", -1 }, { "FAKEAVX=1", 1 }, { "FAKEAVX=sse4", 2 }, { "FAKEAVX=avx2", 3 },
+	};
 	unsigned long start = READ_ONCE(mm->env_start), end = READ_ONCE(mm->env_end);
-	int found = 0;
+	int found = 0, k;
 	size_t len, i;
 	char *buf;
 
@@ -220,14 +239,10 @@ static int fa_env_opt_in(struct mm_struct *mm)
 		return 0;
 	len = access_process_vm(current, start, buf, len, 0);
 	buf[len] = 0;
-	for (i = 0; i < len; i += strlen(buf + i) + 1) {
-		if (!strcmp(buf + i, "FAKEAVX=1"))
-			found = 1;
-		else if (!strcmp(buf + i, "FAKEAVX=avx2"))
-			found = 2;
-		if (found)
-			break;
-	}
+	for (i = 0; i < len && !found; i += strlen(buf + i) + 1)
+		for (k = 0; k < ARRAY_SIZE(modes); k++)
+			if (!strcmp(buf + i, modes[k].s))
+				found = modes[k].v;
 	kvfree(buf);
 	return found;
 }
@@ -273,8 +288,8 @@ static struct fa_mm *fa_mm_get(struct mm_struct *mm)
 	INIT_WORK(&fm->free_work, fa_mm_free_work);
 	INIT_WORK(&fm->refill_work, fa_refill_work);
 	i = fa_env_opt_in(mm);
-	fm->enabled = policy == 1 || i;
-	fm->cpuid_avx = i == 2;
+	fm->enabled = i > 0 || (policy == 1 && i == 0);
+	fm->cpuid_mode = i == 2 ? 1 : i == 3 ? 2 : 0;
 	fm->mn.ops = &fa_mn_ops;
 	if (mmu_notifier_register(&fm->mn, mm)) {
 		kvfree(fm->buf);
@@ -854,6 +869,7 @@ static struct fa_tr *fa_translate_region(struct fa_mm *fm, unsigned long ip,
 		rg->exit_thunk = 0;
 		rg->max_items = tries[i].max_items;
 		rg->no_map = tries[i].no_map;
+		rg->no_sse41 = no_sse41;
 		ret = fa_region_build(rg);
 	}
 	if (ret < 0 || rg->it[0].kind != FA_R_OURS)
@@ -943,6 +959,11 @@ static void fa_slow(struct pt_regs *regs)
 	}
 	if (!fm->enabled)
 		return;
+
+	/* which binary is this, and does CPUID need answering for it? */
+	n = fa_read_insn(ip, buf);
+	if (n && !fa_decode(buf, n, ip, &in) && in.kind != FA_K_XGETBV)
+		fa_note_file(ip, in.kind == FA_K_VEX);
 
 	mutex_lock(&fm->lock);
 	n = fa_read_insn(ip, buf);
@@ -1050,57 +1071,81 @@ static struct notifier_block fa_nb = {
 /* CPUID                                                               */
 
 /*
- * CPUID cannot be made to trap on this hardware. Instead a userspace tool
- * (tools/fakeavx-cpuid) finds the cpuid instructions of a given binary and
- * registers them here; a uprobe on each lets us answer in the CPU's place
- * for processes that opted in.
+ * CPUID cannot be made to trap on this hardware, so a uprobe is placed on
+ * every cpuid instruction of the binaries that matter, and its handler
+ * answers in the CPU's place.
  *
- * What is added to the real answer: SSE4.2 and POPCNT always (programs built
- * for Nehalem and later check for them), AVX/AVX2/OSXSAVE only for processes
- * started with FAKEAVX=avx2 - a program that can do without AVX is faster on
- * its native SSE code paths than on translated AVX.
+ * Which binaries: any file in which a handled process hit an unsupported
+ * instruction. The first time that happens the file's executable segments
+ * are walked instruction by instruction (fa_scan_file) to find its cpuid
+ * instructions. Userspace can also supply sites (tools/fakeavx-cpuid), and
+ * /proc/fakeavx/sites lists everything known so that it can be saved and
+ * given back after a reboot.
+ *
+ * What is added to the real answer: SSE4.1, SSE4.2 and POPCNT always.
+ * AVX/AVX2/OSXSAVE only if the binary has been seen executing a VEX-encoded
+ * instruction (it uses AVX whatever CPUID says), or the process asked with
+ * FAKEAVX=avx2: a program that can do without AVX is faster on its own SSE
+ * code paths than on translated AVX.
  */
+struct fa_file {
+	struct list_head list;
+	struct inode *inode;
+	char *path;
+	bool scanned;
+	bool avx;		/* seen executing VEX-encoded instructions */
+	int nsites;
+};
+
 struct fa_site {
 	struct list_head list;
 	struct uprobe_consumer uc;
 	struct uprobe *up;
-	struct inode *inode;
+	struct fa_file *ff;
 	loff_t off;
 };
 
+#define FA_MAX_SITES	4096	/* per file */
+
+static LIST_HEAD(fa_files);
 static LIST_HEAD(fa_sites);
 static DEFINE_MUTEX(fa_sites_lock);
-static unsigned long stat_cpuid;
+static struct proc_dir_entry *fa_proc_dir;
+static unsigned long stat_cpuid, stat_scans;
 module_param(stat_cpuid, ulong, 0444);
+module_param(stat_scans, ulong, 0444);
 
 static int fa_cpuid_handler(struct uprobe_consumer *uc, struct pt_regs *regs, __u64 *data)
 {
+	struct fa_site *st = container_of(uc, struct fa_site, uc);
 	u32 leaf = regs->ax, sub = regs->cx, a, b, c, d, max;
 	struct fa_mm *fm;
+	bool avx;
 
 	if (!current->mm || !user_64bit_mode(regs))
 		return 0;
 	fm = fa_mm_get(current->mm);
 	if (!fm || !fm->enabled)
 		return 0;	/* the real instruction runs */
+	avx = fm->cpuid_mode == 2 || (fm->cpuid_mode == 0 && READ_ONCE(st->ff->avx));
 
 	cpuid_count(leaf, sub, &a, &b, &c, &d);
 	max = cpuid_eax(0);
 	switch (leaf) {
 	case 0:
-		if (fm->cpuid_avx && a < 7)
+		if (avx && a < 7)
 			a = 7;
 		break;
 	case 1:
-		c |= BIT(20) | BIT(23);			/* SSE4.2, POPCNT */
-		if (fm->cpuid_avx)
+		c |= BIT(19) | BIT(20) | BIT(23);		/* SSE4.1, SSE4.2, POPCNT */
+		if (avx)
 			c |= BIT(26) | BIT(27) | BIT(28);	/* XSAVE, OSXSAVE, AVX */
 		break;
 	case 7:
-		if (fm->cpuid_avx && sub == 0) {
+		if (avx && sub == 0) {
 			if (max < 7)
 				a = b = c = d = 0;
-			b |= BIT(5);			/* AVX2 */
+			b |= BIT(5);				/* AVX2 */
 		}
 		break;
 	}
@@ -1113,9 +1158,64 @@ static int fa_cpuid_handler(struct uprobe_consumer *uc, struct pt_regs *regs, __
 	return 0;
 }
 
+/* fa_sites_lock held. path may be NULL if the file is already known. */
+static struct fa_file *fa_file_get(struct inode *inode, const char *path)
+{
+	struct fa_file *ff;
+
+	list_for_each_entry(ff, &fa_files, list)
+		if (ff->inode == inode)
+			return ff;
+	if (!path || !S_ISREG(inode->i_mode))
+		return NULL;
+	ff = kzalloc(sizeof(*ff), GFP_KERNEL);
+	if (!ff)
+		return NULL;
+	ff->path = kstrdup(path, GFP_KERNEL);
+	ff->inode = igrab(inode);
+	if (!ff->path || !ff->inode) {
+		if (ff->inode)
+			iput(ff->inode);
+		kfree(ff->path);
+		kfree(ff);
+		return NULL;
+	}
+	list_add_tail(&ff->list, &fa_files);
+	return ff;
+}
+
+/* fa_sites_lock held */
+static int fa_site_add(struct fa_file *ff, loff_t off)
+{
+	struct fa_site *st;
+
+	list_for_each_entry(st, &fa_sites, list)
+		if (st->ff == ff && st->off == off)
+			return 0;
+	if (ff->nsites >= FA_MAX_SITES)
+		return -ENOSPC;
+	st = kzalloc(sizeof(*st), GFP_KERNEL);
+	if (!st)
+		return -ENOMEM;
+	st->ff = ff;
+	st->off = off;
+	st->uc.handler = fa_cpuid_handler;
+	st->up = uprobe_register(ff->inode, off, 0, &st->uc);
+	if (IS_ERR(st->up)) {
+		int ret = PTR_ERR(st->up);
+
+		kfree(st);
+		return ret;
+	}
+	list_add_tail(&st->list, &fa_sites);
+	ff->nsites++;
+	return 0;
+}
+
 static void fa_sites_clear(void)
 {
 	struct fa_site *st, *tmp;
+	struct fa_file *ff, *ftmp;
 
 	mutex_lock(&fa_sites_lock);
 	list_for_each_entry(st, &fa_sites, list)
@@ -1123,67 +1223,185 @@ static void fa_sites_clear(void)
 	uprobe_unregister_sync();
 	list_for_each_entry_safe(st, tmp, &fa_sites, list) {
 		list_del(&st->list);
-		iput(st->inode);
 		kfree(st);
+	}
+	list_for_each_entry_safe(ff, ftmp, &fa_files, list) {
+		list_del(&ff->list);
+		iput(ff->inode);
+		kfree(ff->path);
+		kfree(ff);
 	}
 	mutex_unlock(&fa_sites_lock);
 }
 
-/* "<hex file offset> <path>": the cpuid instruction at that offset of that file */
-static int fa_cpuid_site_set(const char *val, const struct kernel_param *kp)
+/* Walk [start, end) of the file one instruction at a time. fa_sites_lock held. */
+static int fa_scan_range(struct fa_file *ff, struct file *file, loff_t start, loff_t end)
 {
-	struct fa_site *st, *it;
-	unsigned long long off;
-	struct path path;
-	char *end, *name;
-	int ret;
+	const size_t chunk = 1 << 20;
+	u8 *buf = kvmalloc(chunk, GFP_KERNEL);
+	loff_t o = start;
+	int ret = 0;
 
-	off = simple_strtoull(val, &end, 16);
-	if (end == val || *end != ' ')
-		return -EINVAL;
-	name = kstrdup(skip_spaces(end), GFP_KERNEL);
-	if (!name)
+	if (!buf)
 		return -ENOMEM;
-	strim(name);
-	ret = kern_path(name, LOOKUP_FOLLOW, &path);
-	kfree(name);
-	if (ret)
-		return ret;
-	st = kzalloc(sizeof(*st), GFP_KERNEL);
-	if (!st) {
-		path_put(&path);
-		return -ENOMEM;
+	while (o < end && !ret) {
+		loff_t pos = o;
+		ssize_t have = kernel_read(file, buf, min_t(loff_t, chunk, end - o), &pos);
+		bool last = o + have >= end;
+		ssize_t i = 0;
+
+		if (have <= 0) {
+			ret = have ? have : -EIO;
+			break;
+		}
+		/* stop 15 bytes short of the chunk so no instruction is cut off */
+		while (i < have && (last || i + 15 <= have)) {
+			int l = fa_insn_len(buf + i, min_t(ssize_t, 15, have - i));
+
+			if (!l)
+				break;
+			if (l == 2 && buf[i] == 0x0f && buf[i + 1] == 0xa2) {
+				ret = fa_site_add(ff, o + i);
+				if (ret)
+					break;
+			}
+			i += l;
+		}
+		if (!i)
+			break;		/* truncated tail */
+		o += i;
+		if (fatal_signal_pending(current))
+			ret = -EINTR;
+		cond_resched();
 	}
-	st->inode = igrab(d_inode(path.dentry));
-	path_put(&path);
-	if (!st->inode || !S_ISREG(st->inode->i_mode)) {
-		ret = -EINVAL;
-		goto err;
+	kvfree(buf);
+	return ret;
+}
+
+/* Find the cpuid instructions in the executable segments of an ELF file. */
+static int fa_scan_file(struct fa_file *ff, struct file *file)
+{
+	struct elf64_hdr eh;
+	loff_t pos = 0;
+	int i, ret = 0;
+
+	if (kernel_read(file, &eh, sizeof(eh), &pos) != sizeof(eh) ||
+	    memcmp(eh.e_ident, ELFMAG, SELFMAG) || eh.e_ident[EI_CLASS] != ELFCLASS64 ||
+	    eh.e_machine != EM_X86_64 || eh.e_phentsize != sizeof(struct elf64_phdr) ||
+	    eh.e_phnum > 128)
+		return -ENOEXEC;
+	for (i = 0; i < eh.e_phnum && !ret; i++) {
+		struct elf64_phdr ph;
+
+		pos = eh.e_phoff + (loff_t)i * sizeof(ph);
+		if (kernel_read(file, &ph, sizeof(ph), &pos) != sizeof(ph))
+			return -EIO;
+		if (ph.p_type == PT_LOAD && (ph.p_flags & PF_X))
+			ret = fa_scan_range(ff, file, ph.p_offset, ph.p_offset + ph.p_filesz);
 	}
-	st->off = off;
-	st->uc.handler = fa_cpuid_handler;
+	return ret;
+}
+
+/*
+ * A handled process hit an unsupported instruction at ip. Remember the file
+ * it belongs to, whether it was AVX, and look for the file's cpuid
+ * instructions if that has not been done yet.
+ */
+static void fa_note_file(unsigned long ip, bool vex)
+{
+	struct vm_area_struct *vma;
+	struct file *file = NULL;
+	struct fa_file *ff;
+	char *tmp, *path;
+
+	mmap_read_lock(current->mm);
+	vma = vma_lookup(current->mm, ip);
+	if (vma && vma->vm_file)
+		file = get_file(vma->vm_file);
+	mmap_read_unlock(current->mm);
+	if (!file)
+		return;		/* JIT code */
 
 	mutex_lock(&fa_sites_lock);
-	list_for_each_entry(it, &fa_sites, list) {
-		if (it->inode == st->inode && it->off == st->off) {
-			mutex_unlock(&fa_sites_lock);
-			ret = 0;	/* already there */
-			goto err;
+	ff = fa_file_get(file_inode(file), NULL);
+	if (!ff) {
+		tmp = kmalloc(PATH_MAX, GFP_KERNEL);
+		path = tmp ? file_path(file, tmp, PATH_MAX) : NULL;
+		if (!IS_ERR_OR_NULL(path))
+			ff = fa_file_get(file_inode(file), path);
+		kfree(tmp);
+	}
+	if (ff) {
+		if (vex && !ff->avx) {
+			ff->avx = true;
+			pr_info("%s uses AVX; CPUID will say so to it\n", ff->path);
+		}
+		if (autocpuid && !ff->scanned) {
+			int ret = fa_scan_file(ff, file);
+
+			if (ret != -EINTR)
+				ff->scanned = true;
+			stat_scans++;
+			pr_info("%s: %d cpuid instructions found%s\n", ff->path, ff->nsites,
+				ret ? " (scan incomplete)" : "");
 		}
 	}
-	st->up = uprobe_register(st->inode, st->off, 0, &st->uc);
-	if (IS_ERR(st->up)) {
-		ret = PTR_ERR(st->up);
-		mutex_unlock(&fa_sites_lock);
-		goto err;
-	}
-	list_add(&st->list, &fa_sites);
 	mutex_unlock(&fa_sites_lock);
-	return 0;
-err:
-	if (st->inode)
-		iput(st->inode);
-	kfree(st);
+	fput(file);
+}
+
+/*
+ * Written by tools/fakeavx-cpuid, one line per write:
+ *   <hex file offset> <path>    a cpuid instruction
+ *   scanned <path>              the file needs no scan
+ *   avx <path>                  the file uses AVX
+ */
+static int fa_cpuid_site_set(const char *val, const struct kernel_param *kp)
+{
+	unsigned long long off = 0;
+	struct fa_file *ff;
+	struct path path;
+	char *line, *name;
+	int kind, ret;
+
+	line = kstrdup(val, GFP_KERNEL);
+	if (!line)
+		return -ENOMEM;
+	strim(line);
+	name = strchr(line, ' ');
+	if (!name) {
+		kfree(line);
+		return -EINVAL;
+	}
+	*name++ = 0;
+	name = skip_spaces(name);
+	if (!strcmp(line, "scanned")) {
+		kind = 1;
+	} else if (!strcmp(line, "avx")) {
+		kind = 2;
+	} else {
+		kind = 0;
+		ret = kstrtoull(line, 16, &off);
+		if (ret)
+			goto out;
+	}
+	ret = kern_path(name, LOOKUP_FOLLOW, &path);
+	if (ret)
+		goto out;
+	mutex_lock(&fa_sites_lock);
+	ff = fa_file_get(d_inode(path.dentry), name);
+	if (!ff)
+		ret = -EINVAL;
+	else if (kind == 1)
+		ff->scanned = true;
+	else if (kind == 2)
+		ff->avx = true;
+	else
+		ret = fa_site_add(ff, off);
+	mutex_unlock(&fa_sites_lock);
+	path_put(&path);
+out:
+	kfree(line);
 	return ret;
 }
 
@@ -1196,9 +1414,40 @@ static int fa_cpuid_clear_set(const char *val, const struct kernel_param *kp)
 static const struct kernel_param_ops fa_cpuid_site_ops = { .set = fa_cpuid_site_set };
 static const struct kernel_param_ops fa_cpuid_clear_ops = { .set = fa_cpuid_clear_set };
 module_param_cb(cpuid_site, &fa_cpuid_site_ops, NULL, 0200);
-MODULE_PARM_DESC(cpuid_site, "write \"<hex file offset> <path>\" to intercept the cpuid instruction there");
+MODULE_PARM_DESC(cpuid_site, "write-only, see tools/fakeavx-cpuid");
 module_param_cb(cpuid_clear, &fa_cpuid_clear_ops, NULL, 0200);
-MODULE_PARM_DESC(cpuid_clear, "write anything to drop all cpuid sites");
+MODULE_PARM_DESC(cpuid_clear, "write anything to forget all cpuid sites");
+
+/* /proc/fakeavx/sites: everything known, in the format cpuid_site accepts */
+static int fa_sites_show(struct seq_file *m, void *v)
+{
+	struct fa_file *ff;
+	struct fa_site *st;
+
+	mutex_lock(&fa_sites_lock);
+	list_for_each_entry(ff, &fa_files, list) {
+		if (ff->scanned)
+			seq_printf(m, "scanned %s\n", ff->path);
+		if (ff->avx)
+			seq_printf(m, "avx %s\n", ff->path);
+	}
+	list_for_each_entry(st, &fa_sites, list)
+		seq_printf(m, "%llx %s\n", (unsigned long long)st->off, st->ff->path);
+	mutex_unlock(&fa_sites_lock);
+	return 0;
+}
+
+static int fa_sites_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, fa_sites_show, NULL);
+}
+
+static const struct proc_ops fa_sites_proc_ops = {
+	.proc_open = fa_sites_open,
+	.proc_read = seq_read,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
 
 /* ------------------------------------------------------------------ */
 
@@ -1206,10 +1455,11 @@ static int __init fa_init(void)
 {
 	int ret;
 
-	if (!boot_cpu_has(X86_FEATURE_XMM4_1)) {
-		pr_err("this CPU has no SSE4.1; only Penryn-class CPUs are supported\n");
+	if (!boot_cpu_has(X86_FEATURE_SSSE3)) {
+		pr_err("this CPU has no SSSE3; Core 2 or later is required\n");
 		return -ENODEV;
 	}
+	no_sse41 = !boot_cpu_has(X86_FEATURE_XMM4_1);
 	if (boot_cpu_has(X86_FEATURE_AVX) && !force) {
 		pr_err("this CPU already supports AVX\n");
 		return -ENODEV;
@@ -1220,6 +1470,9 @@ static int __init fa_init(void)
 	fa_wq = alloc_workqueue("fakeavx", WQ_UNBOUND, 0);
 	if (!fa_wq)
 		return -ENOMEM;
+	fa_proc_dir = proc_mkdir("fakeavx", NULL);
+	if (fa_proc_dir)
+		proc_create("sites", 0444, fa_proc_dir, &fa_sites_proc_ops);
 	ret = register_kprobe(&fa_kp_new);
 	if (ret) {
 		pr_err("cannot hook wake_up_new_task: %d\n", ret);
@@ -1233,7 +1486,8 @@ static int __init fa_init(void)
 	ret = register_die_notifier(&fa_nb);
 	if (ret)
 		goto err_kp2;
-	pr_info("loaded (policy=%d patch=%d)\n", policy, patch);
+	pr_info("loaded (policy=%d patch=%d, host has %s)\n", policy, patch,
+		no_sse41 ? "SSSE3: SSE4.1 is emulated too" : "SSE4.1");
 	return 0;
 
 err_kp2:
@@ -1241,6 +1495,7 @@ err_kp2:
 err_kp:
 	unregister_kprobe(&fa_kp_new);
 err_wq:
+	proc_remove(fa_proc_dir);
 	destroy_workqueue(fa_wq);
 	return ret;
 }
@@ -1250,6 +1505,7 @@ static void __exit fa_exit(void)
 	struct fa_mm *fm;
 	int bkt;
 
+	proc_remove(fa_proc_dir);
 	fa_sites_clear();
 	unregister_die_notifier(&fa_nb);
 	do {

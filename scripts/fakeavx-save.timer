@@ -1,0 +1,9 @@
+[Unit]
+Description=fakeavx: save the list of known cpuid sites every hour
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1h
+
+[Install]
+WantedBy=timers.target

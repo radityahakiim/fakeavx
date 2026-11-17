@@ -225,3 +225,15 @@ const struct fa_op *fa_lookup(u8 map, u8 pp, u8 opcode)
 	}
 	return NULL;
 }
+
+int fa_is_sse41(u8 map, u8 opcode)
+{
+	if (map == 2)
+		return opcode == 0x10 || opcode == 0x14 || opcode == 0x15 || opcode == 0x17 ||
+		       (opcode >= 0x20 && opcode <= 0x25) || (opcode >= 0x28 && opcode <= 0x2b) ||
+		       (opcode >= 0x30 && opcode <= 0x35) || (opcode >= 0x38 && opcode <= 0x41);
+	if (map == 3)
+		return (opcode >= 0x08 && opcode <= 0x0e) || (opcode >= 0x14 && opcode <= 0x17) ||
+		       (opcode >= 0x20 && opcode <= 0x22) || (opcode >= 0x40 && opcode <= 0x42);
+	return 0;
+}
