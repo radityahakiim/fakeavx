@@ -23,6 +23,8 @@
 /tests/regtest
 /tests/guest/guest_test
 /tests/guest/cpuid_test
+/tests/guest/cpuid_plain
+/tests/lendec_check
 
 # editor / misc
 *.swp

@@ -94,7 +94,8 @@ Module parameters (`/etc/modprobe.d/fakeavx.conf`, or
 | `policy` | 1 | 1: every process unless it has `FAKEAVX=0`. 0: only processes started with `FAKEAVX=1`. |
 | `patch` | 1 | Overwrite translated instructions with a jump. 0 traps on every execution (slow; for debugging). |
 | `autocpuid` | 1 | Find a binary's `cpuid` instructions automatically (below). |
-| `stat_*` | — | Read-only counters, e.g. `stat_slow` (first-time traps), `stat_fast` (repeat traps), `stat_regions`, `stat_patched`, `stat_cpuid`, `stat_scans`, `stat_unsupported`. |
+| `execscan` | 1 | Examine every program before it starts (below); 0 waits for its first unsupported instruction instead. |
+| `stat_*` | — | Read-only counters, e.g. `stat_slow` (first-time traps), `stat_fast` (repeat traps), `stat_regions`, `stat_patched`, `stat_cpuid`, `stat_scans_exec` / `stat_scans` (files examined at start / after a trap), `stat_unsupported`. |
 
 `stat_fast` is the number to watch: every count is a full kernel round trip.
 If it keeps climbing while a program runs, that program has hot instructions
@@ -107,12 +108,26 @@ Many programs ask CPUID before using an instruction set, and CPUID cannot be
 trapped on a Core 2. The module therefore puts a probe on the `cpuid`
 instructions of the binaries that matter and answers in the CPU's place.
 
-This is automatic. The first time a binary executes an unsupported
-instruction, the module walks that file's code, finds its `cpuid`
-instructions (a few seconds for a 100 MB executable, once) and from then on
-answers them — for every process running that file, now and later. With the
-permanent installation the list survives reboots; a file that has changed
-since (an update) is simply scanned again.
+This is automatic. Every program is examined before it executes its first
+instruction (the module sits in the kernel's list of executable formats, ahead
+of the ELF loader). The first time a given file is started, the module walks
+its code once:
+
+- If the code contains instructions this CPU lacks (AVX, POPCNT, SSE4.2,
+  SSE4.1 on CPUs without it), its `cpuid` instructions are answered from that
+  first run on, for every process running the file.
+- If it contains none, the program keeps seeing the real CPU, and the file is
+  remembered as not needing anything.
+
+The walk costs a fraction of a second for Bun and about a second for Claude
+Code (measured on a recent desktop; expect a few times that on a Core 2), once
+per file. With the permanent installation the results survive reboots, so a
+program is only examined again when it changes (an update).
+
+Shared libraries are not examined at start. glibc asks CPUID inside `ld.so`
+for every program, and answering there would make every program on the
+system pick glibc's SSE4.2 string functions, which this CPU would have to
+emulate. A library is handled when one of its own instructions traps.
 
 What CPUID is made to report:
 
@@ -125,16 +140,21 @@ What CPUID is made to report:
 
 Limits of the automatic way:
 
-- A program that asks CPUID *before* executing anything unsupported, and gives
-  up, fails on its very first run and works from the second. To avoid even
-  that: `fakeavx-cpuid add /path/to/program`.
+- A program that contains AVX/SSE4.2/POPCNT code only as an option, chosen at
+  run time, is answered too, so it may now pick its SSE4.2/POPCNT paths
+  instead of its plain ones. These still run, but SSE4.2 string instructions
+  are emulated and slower. `FAKEAVX=0` makes such a program see the real CPU.
+- A statically linked program contains glibc's AVX string functions, so it
+  always counts as needing CPUID answered (for the reason above).
 - A program that checks for AVX and refuses to run without it never executes
   an AVX instruction, so it is never recognised as an AVX program: start it
   with `FAKEAVX=avx2`, or mark it once with `fakeavx-cpuid avx /path/to/program`.
-- Only the binary in which the instruction was hit is covered, not the shared
-  libraries it loads (each is handled when one of *its* instructions traps).
+- A shared library that asks CPUID itself, before executing anything
+  unsupported, gets the real answer on its first run. `fakeavx-cpuid add
+  /path/to/library.so` covers it in advance.
 
-`fakeavx-cpuid list` shows what is known; see `fakeavx-cpuid` without
+`fakeavx-cpuid list` shows the files whose CPUID is answered (`list -a` also
+the ones examined and found not to need it); see `fakeavx-cpuid` without
 arguments for the rest. `fakeavx-census FILE` reports which instruction-set
 extensions a binary uses, to see in advance whether fakeavx can run it.
 
@@ -156,7 +176,8 @@ executables, so keep an eye on `stat_fast`.
 ```sh
 make guest
 tests/guest/guest_test      # AVX2 + POPCNT workload, threads, fork
-tests/guest/cpuid_test      # CPUID answers + SSE4.2 (run it twice the first time)
+tests/guest/cpuid_test      # CPUID answers + SSE4.2, correct on the first run
+tests/guest/cpuid_plain     # a program needing nothing: must see the real CPU
 ```
 
 ## What is implemented
@@ -250,6 +271,7 @@ and extra arguments are passed to `insmod` (e.g. `./run.sh patch=0`).
 | In-kernel `cpuid` scanner vs. objdump (5 binaries incl. Bun, Claude Code) | development machine | identical site lists |
 | End-to-end on an SSSE3-only CPU model (`-cpu core2duo`) | QEMU | pass |
 | Automatic mode, automatic CPUID discovery, cache save/restore | QEMU, both CPU models | pass |
+| CPUID answered on a program's first run; a program needing nothing left alone | QEMU, both CPU models | pass |
 | Bun and Claude Code (version before automatic mode) | ThinkPad T61 P8600 | reported working |
 | `scripts/install.sh` (DKMS, systemd units) | — | **not run**: only the file layout was checked |
 | Automatic mode, SSSE3 support | real hardware | **not yet run** |

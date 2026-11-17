@@ -1,12 +1,13 @@
 #!/bin/sh
 # fakeavx-cpuid - manage the list of cpuid instructions fakeavx answers for.
 #
-# Normally nothing here needs to be run by hand: the module finds a binary's
-# cpuid instructions by itself the first time that binary hits an unsupported
-# instruction, and an installed system saves and restores the list across
-# reboots (fakeavx.service).
+# Normally nothing here needs to be run by hand: the module looks at every
+# program before it starts (and at a library when it first hits an unsupported
+# instruction) and finds the cpuid instructions itself; an installed system
+# saves and restores what it found across reboots (fakeavx.service).
 #
-#   fakeavx-cpuid list            what the module currently knows
+#   fakeavx-cpuid list [-a]       files whose CPUID is answered (-a: also the
+#                                 programs that were checked and need nothing)
 #   fakeavx-cpuid add FILE        register FILE's cpuid instructions now, so that
 #                                 even its first run sees the emulated features
 #                                 (needs objdump and gawk)
@@ -59,11 +60,15 @@ write_param() {	# name value
 case "$1" in
 list)
 	need_module
-	awk '
+	awk -v all="$([ "$2" = -a ] && echo 1)" '
+	$1 == "clean" { sub(/^[^ ]+ /, ""); if (all) clean[$0] = 1; next }
 	$1 == "scanned" { sub(/^[^ ]+ /, ""); seen[$0] = 1; next }
 	$1 == "avx" { sub(/^[^ ]+ /, ""); seen[$0] = 1; avx[$0] = 1; next }
 	{ sub(/^[^ ]+ /, ""); seen[$0] = 1; n[$0]++ }
-	END { for (p in seen) printf "%5d cpuid sites%s  %s\n", n[p], avx[p] ? ", reports AVX" : "", p }' "$PROC"
+	END {
+		for (p in seen) printf "%5d cpuid sites%s  %s\n", n[p], avx[p] ? ", reports AVX" : "", p
+		for (p in clean) printf "    needs nothing  %s\n", p
+	}' "$PROC"
 	;;
 scan)
 	[ -f "$2" ] || { echo "usage: $0 scan FILE" >&2; exit 1; }
@@ -90,31 +95,33 @@ avx)
 save)
 	need_module
 	mkdir -p "$(dirname "$CACHE")"
+	cur=$(mktemp)
+	trap 'rm -f "$cur"' EXIT
+	cat "$PROC" > "$cur"
 	{
 		# remember what each file looked like, to notice later if it changed
-		sed 's/^[^ ]* //' "$PROC" | sort -u | while IFS= read -r p; do
-			[ -f "$p" ] && printf 'stat %s %s\n' "$(stat -c '%s.%Y' "$p")" "$p"
-		done
-		cat "$PROC"
+		sed 's/^[^ ]* //' "$cur" | sort -u | tr '\n' '\0' |
+			xargs -0 -r stat -c 'stat %s.%Y %n' -- 2>/dev/null || true
+		cat "$cur"
 	} > "$CACHE.tmp"
 	mv "$CACHE.tmp" "$CACHE"
 	;;
 restore)
 	need_module
 	[ -f "$CACHE" ] || exit 0
-	valid=$(mktemp)
-	trap 'rm -f "$valid"' EXIT
-	while read -r kind sig path; do
-		[ "$kind" = stat ] || continue
-		[ -f "$path" ] && [ "$(stat -c '%s.%Y' "$path")" = "$sig" ] && printf '%s\n' "$path" >> "$valid"
-	done < "$CACHE"
-	n=0
+	now=$(mktemp)
+	ok=$(mktemp)
+	trap 'rm -f "$now" "$ok"' EXIT
+	# what the files look like now; then keep the entries of unchanged files
+	sed -n 's/^stat [^ ]* //p' "$CACHE" | tr '\n' '\0' |
+		xargs -0 -r stat -c '%s.%Y %n' -- 2>/dev/null > "$now" || true
+	awk 'FNR == NR { p = $0; sub(/^[^ ]+ /, "", p); now[p] = $1; next }
+	$1 == "stat" { p = $0; sub(/^stat [^ ]+ /, "", p); if (now[p] == $2) ok[p] = 1; next }
+	{ p = $0; sub(/^[^ ]+ /, "", p); if (ok[p]) print }' "$now" "$CACHE" > "$ok"
 	while IFS= read -r line; do
-		case "$line" in stat\ *) continue ;; esac
-		if grep -Fxq -- "${line#* }" "$valid"; then
-			write_param cpuid_site "$line" && n=$((n + 1))
-		fi
-	done < "$CACHE"
+		write_param cpuid_site "$line" || true
+	done < "$ok"
+	n=$(wc -l < "$ok")
 	echo "fakeavx: $n cached entries restored"
 	;;
 clear)
@@ -122,7 +129,7 @@ clear)
 	write_param cpuid_clear 1
 	;;
 *)
-	sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+	sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
 	exit 1
 	;;
 esac

@@ -425,11 +425,24 @@ the temporary trapping byte.
 
 **CPUID (§9).** Implemented with uprobes: confirmed on 6.18.39 that a uprobe
 handler runs in sleepable context and that changing `regs->ip` makes the
-kernel skip the probed instruction. Sites are found by the module itself: the
-#UD slow path notes which file the instruction belongs to and, once per file,
-walks its executable ELF segments with `core/lendec.c` (a length-only decoder;
+kernel skip the probed instruction. Sites are found by the module itself, once
+per file, by walking its executable ELF segments with `core/lendec.c` (a length-only decoder;
 the kernel's `insn_decode()` is not exported). Its site lists are identical to
-objdump's on the binaries tried. `/proc/fakeavx/sites` exports the state in
+objdump's on the binaries tried. A file is walked at the first of two moments:
+(1) when it is exec'd: the module registers a `linux_binfmt` at the head of
+the format list whose `load_binary` examines the file and returns `-ENOEXEC`,
+so the ELF loader runs next. This is the only exported hook that runs in
+sleepable context before the new program's first instruction (kprobes and the
+exec tracepoint cannot sleep, and `task_work_add` is not exported); uprobes
+registered there are installed when the loader maps the file. A file is
+answered only if its code contains an instruction the host lacks, otherwise
+it is recorded as `clean`. Only main executables: answering `ld.so`'s CPUID
+would move every process onto emulated SSE4.2 string functions. (2) when a
+handled process traps in a file not yet answered (shared libraries,
+`execscan=0`). File entries are keyed by device, inode number and ctime and
+pin the inode only once uprobes are attached, so the entry kept for every
+program ever run does not keep deleted files alive across package updates.
+`/proc/fakeavx/sites` exports the state in
 the same line format the `cpuid_site` parameter accepts, which is all the
 persistence there is: a systemd unit saves it and writes it back at boot.
 AVX is reported only to files seen executing VEX-encoded instructions.
