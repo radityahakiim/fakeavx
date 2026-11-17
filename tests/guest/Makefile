@@ -1,7 +1,5 @@
 CC ?= gcc
-all: guest_test cpuid_test cpuid_plain
-cpuid_plain: cpuid_plain.c
-	$(CC) -O2 -march=core2 -mtune=generic -o $@ cpuid_plain.c
+all: guest_test cpuid_test
 cpuid_test: cpuid_test.c
 	$(CC) -O2 -fPIE -msse4.2 -mpopcnt -static-pie -o $@ cpuid_test.c
 ref.o: kern.c kern.h
@@ -11,4 +9,4 @@ avx.o: kern.c kern.h
 guest_test: guest_test.c ref.o avx.o kern.h
 	$(CC) -O2 -fPIE -mavx2 -mpopcnt -static-pie -o $@ guest_test.c ref.o avx.o -lpthread -lm
 clean:
-	rm -f *.o guest_test cpuid_test cpuid_plain
+	rm -f *.o guest_test cpuid_test

@@ -41,7 +41,6 @@
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/file.h>
-#include <linux/binfmts.h>
 #include <asm/trapnr.h>
 #include <asm/msr.h>
 #include <asm/cpufeature.h>
@@ -1076,12 +1075,10 @@ static struct notifier_block fa_nb = {
  * every cpuid instruction of the binaries that matter, and its handler
  * answers in the CPU's place.
  *
- * Which binaries: every program is examined before it starts
- * (fa_exec_check): its executable segments are walked instruction by
- * instruction (fa_scan_file), and its cpuid instructions are answered if its
- * code contains anything this CPU lacks. Any other file (a shared library) is
- * walked when a handled process hits an unsupported instruction in it.
- * Userspace can also supply sites (tools/fakeavx-cpuid), and
+ * Which binaries: any file in which a handled process hit an unsupported
+ * instruction. The first time that happens the file's executable segments
+ * are walked instruction by instruction (fa_scan_file) to find its cpuid
+ * instructions. Userspace can also supply sites (tools/fakeavx-cpuid), and
  * /proc/fakeavx/sites lists everything known so that it can be saved and
  * given back after a reboot.
  *
@@ -1092,24 +1089,12 @@ static struct notifier_block fa_nb = {
  * code paths than on translated AVX.
  */
 struct fa_file {
-	struct hlist_node node;
-	dev_t dev;			/* identity: device, inode number, ctime */
-	unsigned long ino;
-	struct timespec64 ctime;
-	struct inode *inode;		/* pinned only once it has uprobes */
-	struct mutex scan_lock;		/* one scan of this file at a time */
+	struct list_head list;
+	struct inode *inode;
 	char *path;
-	bool scanned;		/* its cpuid instructions are answered */
-	bool clean;		/* scanned at exec: uses nothing this CPU lacks */
+	bool scanned;
 	bool avx;		/* seen executing VEX-encoded instructions */
 	int nsites;
-};
-
-/* Result of walking a file's executable segments. */
-struct fa_scan {
-	loff_t *offs;		/* file offsets of cpuid instructions */
-	int n;
-	bool needs;		/* contains instructions this CPU lacks */
 };
 
 struct fa_site {
@@ -1122,19 +1107,13 @@ struct fa_site {
 
 #define FA_MAX_SITES	4096	/* per file */
 
-static DEFINE_HASHTABLE(fa_files, 9);
+static LIST_HEAD(fa_files);
 static LIST_HEAD(fa_sites);
-static DEFINE_MUTEX(fa_sites_lock);	/* fa_files, fa_sites, fa_file fields */
-static DECLARE_RWSEM(fa_files_rwsem);	/* write: fa_file structures are freed */
+static DEFINE_MUTEX(fa_sites_lock);
 static struct proc_dir_entry *fa_proc_dir;
-static unsigned long stat_cpuid, stat_scans, stat_scans_exec;
+static unsigned long stat_cpuid, stat_scans;
 module_param(stat_cpuid, ulong, 0444);
 module_param(stat_scans, ulong, 0444);
-module_param(stat_scans_exec, ulong, 0444);
-
-static bool execscan = true;
-module_param(execscan, bool, 0644);
-MODULE_PARM_DESC(execscan, "look at every new program before it starts, so that even its first run gets CPUID answered (default on)");
 
 static int fa_cpuid_handler(struct uprobe_consumer *uc, struct pt_regs *regs, __u64 *data)
 {
@@ -1179,86 +1158,34 @@ static int fa_cpuid_handler(struct uprobe_consumer *uc, struct pt_regs *regs, __
 	return 0;
 }
 
-static u32 fa_file_hash(dev_t dev, unsigned long ino)
-{
-	return hash_long(ino ^ ((unsigned long)dev << 20), 32);
-}
-
-/*
- * fa_sites_lock held. An entry without uprobes does not pin its inode, so
- * the inode number may since have been reused for another file: a changed
- * ctime makes the entry start over.
- */
-static struct fa_file *fa_file_find(struct inode *inode)
-{
-	struct timespec64 ct = inode_get_ctime(inode);
-	dev_t dev = inode->i_sb->s_dev;
-	struct fa_file *ff;
-
-	hash_for_each_possible(fa_files, ff, node, fa_file_hash(dev, inode->i_ino)) {
-		if (ff->dev != dev || ff->ino != inode->i_ino)
-			continue;
-		if (!ff->inode && !timespec64_equal(&ff->ctime, &ct)) {
-			ff->ctime = ct;
-			ff->scanned = false;
-			ff->clean = false;
-			ff->avx = false;
-		}
-		return ff;
-	}
-	return NULL;
-}
-
-/* fa_sites_lock held */
-static struct fa_file *fa_file_new(struct inode *inode, const char *path)
+/* fa_sites_lock held. path may be NULL if the file is already known. */
+static struct fa_file *fa_file_get(struct inode *inode, const char *path)
 {
 	struct fa_file *ff;
 
-	if (!S_ISREG(inode->i_mode))
+	list_for_each_entry(ff, &fa_files, list)
+		if (ff->inode == inode)
+			return ff;
+	if (!path || !S_ISREG(inode->i_mode))
 		return NULL;
 	ff = kzalloc(sizeof(*ff), GFP_KERNEL);
 	if (!ff)
 		return NULL;
 	ff->path = kstrdup(path, GFP_KERNEL);
-	if (!ff->path) {
+	ff->inode = igrab(inode);
+	if (!ff->path || !ff->inode) {
+		if (ff->inode)
+			iput(ff->inode);
+		kfree(ff->path);
 		kfree(ff);
 		return NULL;
 	}
-	ff->dev = inode->i_sb->s_dev;
-	ff->ino = inode->i_ino;
-	ff->ctime = inode_get_ctime(inode);
-	mutex_init(&ff->scan_lock);
-	hash_add(fa_files, &ff->node, fa_file_hash(ff->dev, ff->ino));
-	return ff;
-}
-
-/* The entry of an open file, created if needed. Takes fa_sites_lock. */
-static struct fa_file *fa_file_of(struct file *file)
-{
-	struct inode *inode = file_inode(file);
-	struct fa_file *ff;
-	char *tmp, *path;
-
-	mutex_lock(&fa_sites_lock);
-	ff = fa_file_find(inode);
-	mutex_unlock(&fa_sites_lock);
-	if (ff)
-		return ff;
-	tmp = kmalloc(PATH_MAX, GFP_KERNEL);
-	if (!tmp)
-		return NULL;
-	path = file_path(file, tmp, PATH_MAX);
-	mutex_lock(&fa_sites_lock);
-	ff = fa_file_find(inode);
-	if (!ff && !IS_ERR(path))
-		ff = fa_file_new(inode, path);
-	mutex_unlock(&fa_sites_lock);
-	kfree(tmp);
+	list_add_tail(&ff->list, &fa_files);
 	return ff;
 }
 
 /* fa_sites_lock held */
-static int fa_site_add(struct fa_file *ff, struct inode *inode, loff_t off)
+static int fa_site_add(struct fa_file *ff, loff_t off)
 {
 	struct fa_site *st;
 
@@ -1267,11 +1194,6 @@ static int fa_site_add(struct fa_file *ff, struct inode *inode, loff_t off)
 			return 0;
 	if (ff->nsites >= FA_MAX_SITES)
 		return -ENOSPC;
-	if (!ff->inode) {
-		ff->inode = igrab(inode);
-		if (!ff->inode)
-			return -ENOENT;
-	}
 	st = kzalloc(sizeof(*st), GFP_KERNEL);
 	if (!st)
 		return -ENOMEM;
@@ -1293,11 +1215,8 @@ static int fa_site_add(struct fa_file *ff, struct inode *inode, loff_t off)
 static void fa_sites_clear(void)
 {
 	struct fa_site *st, *tmp;
-	struct fa_file *ff;
-	struct hlist_node *ftmp;
-	int bkt;
+	struct fa_file *ff, *ftmp;
 
-	down_write(&fa_files_rwsem);	/* no scan in progress */
 	mutex_lock(&fa_sites_lock);
 	list_for_each_entry(st, &fa_sites, list)
 		uprobe_unregister_nosync(st->up, &st->uc);
@@ -1306,58 +1225,17 @@ static void fa_sites_clear(void)
 		list_del(&st->list);
 		kfree(st);
 	}
-	hash_for_each_safe(fa_files, bkt, ftmp, ff, node) {
-		hash_del(&ff->node);
-		if (ff->inode)
-			iput(ff->inode);
-		mutex_destroy(&ff->scan_lock);
+	list_for_each_entry_safe(ff, ftmp, &fa_files, list) {
+		list_del(&ff->list);
+		iput(ff->inode);
 		kfree(ff->path);
 		kfree(ff);
 	}
 	mutex_unlock(&fa_sites_lock);
-	up_write(&fa_files_rwsem);
 }
 
-/*
- * Would this instruction (l bytes at p, already length-decoded) fault on
- * this CPU and be handled by fakeavx? Cheap byte checks first: almost no
- * instruction gets as far as fa_decode.
- */
-static bool fa_host_lacks(const u8 *p, int l)
-{
-	struct fa_insn in;
-	int i = 0;
-
-	while (i < l && (p[i] == 0x66 || p[i] == 0x67 || p[i] == 0xf2 || p[i] == 0xf3 ||
-			 p[i] == 0x2e || p[i] == 0x3e || p[i] == 0x26 || p[i] == 0x36 ||
-			 p[i] == 0x64 || p[i] == 0x65 || p[i] == 0xf0))
-		i++;
-	if (i < l && (p[i] & 0xf0) == 0x40)
-		i++;
-	if (i >= l)
-		return false;
-	if (p[i] != 0xc4 && p[i] != 0xc5 &&
-	    !(p[i] == 0x0f && i + 1 < l && (p[i + 1] == 0xb8 || p[i + 1] == 0x38 || p[i + 1] == 0x3a)))
-		return false;
-	if (fa_decode(p, l, 0, &in))
-		return false;
-	switch (in.kind) {
-	case FA_K_VEX:
-		return true;
-	case FA_K_POPCNT:
-		return !boot_cpu_has(X86_FEATURE_POPCNT);
-	case FA_K_SSE4:
-		if ((in.map == 2 && (in.opcode == 0x37 || in.opcode >= 0xf0)) ||
-		    (in.map == 3 && in.opcode >= 0x60 && in.opcode <= 0x63))
-			return !boot_cpu_has(X86_FEATURE_XMM4_2);
-		return no_sse41;
-	default:
-		return false;	/* XGETBV only runs after CPUID said XSAVE */
-	}
-}
-
-/* Walk [start, end) of the file one instruction at a time. */
-static int fa_scan_range(struct fa_scan *sc, struct file *file, loff_t start, loff_t end)
+/* Walk [start, end) of the file one instruction at a time. fa_sites_lock held. */
+static int fa_scan_range(struct fa_file *ff, struct file *file, loff_t start, loff_t end)
 {
 	const size_t chunk = 1 << 20;
 	u8 *buf = kvmalloc(chunk, GFP_KERNEL);
@@ -1383,13 +1261,9 @@ static int fa_scan_range(struct fa_scan *sc, struct file *file, loff_t start, lo
 			if (!l)
 				break;
 			if (l == 2 && buf[i] == 0x0f && buf[i + 1] == 0xa2) {
-				if (sc->n >= FA_MAX_SITES) {
-					ret = -ENOSPC;
+				ret = fa_site_add(ff, o + i);
+				if (ret)
 					break;
-				}
-				sc->offs[sc->n++] = o + i;
-			} else if (!sc->needs && fa_host_lacks(buf + i, l)) {
-				sc->needs = true;
 			}
 			i += l;
 		}
@@ -1405,7 +1279,7 @@ static int fa_scan_range(struct fa_scan *sc, struct file *file, loff_t start, lo
 }
 
 /* Find the cpuid instructions in the executable segments of an ELF file. */
-static int fa_scan_file(struct fa_scan *sc, struct file *file)
+static int fa_scan_file(struct fa_file *ff, struct file *file)
 {
 	struct elf64_hdr eh;
 	loff_t pos = 0;
@@ -1423,78 +1297,9 @@ static int fa_scan_file(struct fa_scan *sc, struct file *file)
 		if (kernel_read(file, &ph, sizeof(ph), &pos) != sizeof(ph))
 			return -EIO;
 		if (ph.p_type == PT_LOAD && (ph.p_flags & PF_X))
-			ret = fa_scan_range(sc, file, ph.p_offset, ph.p_offset + ph.p_filesz);
+			ret = fa_scan_range(ff, file, ph.p_offset, ph.p_offset + ph.p_filesz);
 	}
 	return ret;
-}
-
-/*
- * Decide whether CPUID must be answered for a file, scanning it if that is
- * not known yet.
- *
- * trapped: a handled process hit an unsupported instruction in the file, so
- * the answer is yes. Otherwise the file is about to be executed, and the
- * answer is yes only if its code contains instructions this CPU lacks; a
- * program without any is better off seeing the real CPU, and is remembered
- * as clean so it is not scanned again.
- */
-static void fa_examine(struct file *file, bool trapped, bool vex)
-{
-	struct fa_scan sc = {};
-	struct fa_file *ff;
-	int i, ret, err = 0;
-	bool todo;
-
-	down_read(&fa_files_rwsem);
-	ff = fa_file_of(file);
-	if (!ff)
-		goto out;
-	mutex_lock(&fa_sites_lock);
-	if (vex && !ff->avx) {
-		ff->avx = true;
-		pr_info("%s uses AVX; CPUID will say so to it\n", ff->path);
-	}
-	todo = autocpuid && !ff->scanned && (trapped || !ff->clean);
-	mutex_unlock(&fa_sites_lock);
-	if (!todo)
-		goto out;
-
-	/* a second process starting the same program waits here for the result */
-	mutex_lock(&ff->scan_lock);
-	mutex_lock(&fa_sites_lock);
-	todo = !ff->scanned && (trapped || !ff->clean);
-	mutex_unlock(&fa_sites_lock);
-	if (!todo)
-		goto unlock;
-	sc.offs = kvmalloc_array(FA_MAX_SITES, sizeof(*sc.offs), GFP_KERNEL);
-	if (!sc.offs)
-		goto unlock;
-	ret = fa_scan_file(&sc, file);
-	if (trapped)
-		stat_scans++;
-	else
-		stat_scans_exec++;
-	if (ret == -EINTR || ret == -ENOMEM)
-		goto unlock;		/* try again next time */
-
-	mutex_lock(&fa_sites_lock);
-	if (trapped || sc.needs) {
-		for (i = 0; i < sc.n && !err; i++)
-			err = fa_site_add(ff, file_inode(file), sc.offs[i]);
-		ff->scanned = true;
-		ff->clean = false;
-		pr_info("%s: %d cpuid instructions found%s%s\n", ff->path, ff->nsites,
-			trapped ? "" : " before its first run",
-			ret || err ? " (scan incomplete)" : "");
-	} else {
-		ff->clean = true;
-	}
-	mutex_unlock(&fa_sites_lock);
-unlock:
-	kvfree(sc.offs);
-	mutex_unlock(&ff->scan_lock);
-out:
-	up_read(&fa_files_rwsem);
 }
 
 /*
@@ -1506,6 +1311,8 @@ static void fa_note_file(unsigned long ip, bool vex)
 {
 	struct vm_area_struct *vma;
 	struct file *file = NULL;
+	struct fa_file *ff;
+	char *tmp, *path;
 
 	mmap_read_lock(current->mm);
 	vma = vma_lookup(current->mm, ip);
@@ -1514,40 +1321,39 @@ static void fa_note_file(unsigned long ip, bool vex)
 	mmap_read_unlock(current->mm);
 	if (!file)
 		return;		/* JIT code */
-	fa_examine(file, true, vex);
+
+	mutex_lock(&fa_sites_lock);
+	ff = fa_file_get(file_inode(file), NULL);
+	if (!ff) {
+		tmp = kmalloc(PATH_MAX, GFP_KERNEL);
+		path = tmp ? file_path(file, tmp, PATH_MAX) : NULL;
+		if (!IS_ERR_OR_NULL(path))
+			ff = fa_file_get(file_inode(file), path);
+		kfree(tmp);
+	}
+	if (ff) {
+		if (vex && !ff->avx) {
+			ff->avx = true;
+			pr_info("%s uses AVX; CPUID will say so to it\n", ff->path);
+		}
+		if (autocpuid && !ff->scanned) {
+			int ret = fa_scan_file(ff, file);
+
+			if (ret != -EINTR)
+				ff->scanned = true;
+			stat_scans++;
+			pr_info("%s: %d cpuid instructions found%s\n", ff->path, ff->nsites,
+				ret ? " (scan incomplete)" : "");
+		}
+	}
+	mutex_unlock(&fa_sites_lock);
 	fput(file);
 }
-
-/*
- * Every exec passes through here before the ELF loader, in a context that
- * may sleep, and before the new program runs a single instruction: the one
- * moment at which its cpuid instructions can still be found in time for its
- * first run. Uprobes registered now are installed when the loader maps the
- * file. Shared libraries are not looked at: glibc's own CPU check (in
- * ld.so) would then send every program to SSE4.2 string functions, which
- * this CPU would have to emulate.
- */
-static int fa_exec_check(struct linux_binprm *bprm)
-{
-	const struct elf64_hdr *eh = (const void *)bprm->buf;
-
-	if (READ_ONCE(execscan) && READ_ONCE(autocpuid) &&
-	    !memcmp(eh->e_ident, ELFMAG, SELFMAG) && eh->e_ident[EI_CLASS] == ELFCLASS64 &&
-	    eh->e_machine == EM_X86_64 && (eh->e_type == ET_EXEC || eh->e_type == ET_DYN))
-		fa_examine(bprm->file, false, false);
-	return -ENOEXEC;	/* now the real loader */
-}
-
-static struct linux_binfmt fa_binfmt = {
-	.module = THIS_MODULE,
-	.load_binary = fa_exec_check,
-};
 
 /*
  * Written by tools/fakeavx-cpuid, one line per write:
  *   <hex file offset> <path>    a cpuid instruction
  *   scanned <path>              the file needs no scan
- *   clean <path>                the file uses nothing this CPU lacks
  *   avx <path>                  the file uses AVX
  */
 static int fa_cpuid_site_set(const char *val, const struct kernel_param *kp)
@@ -1573,8 +1379,6 @@ static int fa_cpuid_site_set(const char *val, const struct kernel_param *kp)
 		kind = 1;
 	} else if (!strcmp(line, "avx")) {
 		kind = 2;
-	} else if (!strcmp(line, "clean")) {
-		kind = 3;
 	} else {
 		kind = 0;
 		ret = kstrtoull(line, 16, &off);
@@ -1584,23 +1388,17 @@ static int fa_cpuid_site_set(const char *val, const struct kernel_param *kp)
 	ret = kern_path(name, LOOKUP_FOLLOW, &path);
 	if (ret)
 		goto out;
-	down_read(&fa_files_rwsem);
 	mutex_lock(&fa_sites_lock);
-	ff = fa_file_find(d_inode(path.dentry));
-	if (!ff)
-		ff = fa_file_new(d_inode(path.dentry), name);
+	ff = fa_file_get(d_inode(path.dentry), name);
 	if (!ff)
 		ret = -EINVAL;
 	else if (kind == 1)
 		ff->scanned = true;
 	else if (kind == 2)
 		ff->avx = true;
-	else if (kind == 3)
-		ff->clean = !ff->scanned;
 	else
-		ret = fa_site_add(ff, d_inode(path.dentry), off);
+		ret = fa_site_add(ff, off);
 	mutex_unlock(&fa_sites_lock);
-	up_read(&fa_files_rwsem);
 	path_put(&path);
 out:
 	kfree(line);
@@ -1625,14 +1423,11 @@ static int fa_sites_show(struct seq_file *m, void *v)
 {
 	struct fa_file *ff;
 	struct fa_site *st;
-	int bkt;
 
 	mutex_lock(&fa_sites_lock);
-	hash_for_each(fa_files, bkt, ff, node) {
+	list_for_each_entry(ff, &fa_files, list) {
 		if (ff->scanned)
 			seq_printf(m, "scanned %s\n", ff->path);
-		else if (ff->clean)
-			seq_printf(m, "clean %s\n", ff->path);
 		if (ff->avx)
 			seq_printf(m, "avx %s\n", ff->path);
 	}
@@ -1691,7 +1486,6 @@ static int __init fa_init(void)
 	ret = register_die_notifier(&fa_nb);
 	if (ret)
 		goto err_kp2;
-	insert_binfmt(&fa_binfmt);	/* first in line, ahead of the ELF loader */
 	pr_info("loaded (policy=%d patch=%d, host has %s)\n", policy, patch,
 		no_sse41 ? "SSSE3: SSE4.1 is emulated too" : "SSE4.1");
 	return 0;
@@ -1712,7 +1506,6 @@ static void __exit fa_exit(void)
 	int bkt;
 
 	proc_remove(fa_proc_dir);
-	unregister_binfmt(&fa_binfmt);
 	fa_sites_clear();
 	unregister_die_notifier(&fa_nb);
 	do {
