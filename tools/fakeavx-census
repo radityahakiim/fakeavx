@@ -1,0 +1,35 @@
+#!/bin/sh
+# fakeavx-census FILE - which instruction-set extensions does a binary use?
+#
+# Static count from objdump's linear disassembly (takes minutes for very large
+# binaries). Tells you whether fakeavx can run the program:
+#   SSE4.2 / POPCNT / AVX / AVX2   emulated
+#   BMI1/BMI2, FMA, MOVBE, AES...  NOT emulated: fine if they are only in
+#                                  code selected at run time, fatal otherwise
+#   LZCNT                          can never be emulated (does not trap)
+# Small counts next to millions of instructions usually mean "run-time
+# dispatched library code"; large counts mean the whole program was built
+# for that instruction set.
+set -e
+[ -f "$1" ] || { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+LC_ALL=C objdump -d --no-show-raw-insn "$1" | awk -F'\t' '
+NF >= 2 {
+	split($2, a, " "); m = a[1]
+	if (m ~ /^(rep|repz|repnz|lock|notrack|bnd|data16|cs)$/) m = a[2]
+	total++
+	if ($2 ~ /ymm/) n["256-bit AVX (ymm)"]++
+	if ($2 ~ /zmm/) n["AVX-512 (zmm)"]++
+	if (m ~ /^v/) n["AVX-encoded (v*)"]++
+	if (m ~ /^vf(n)?m(add|sub)/) n["FMA"]++
+	if (m ~ /^popcnt/) n["POPCNT"]++
+	if (m ~ /^(pcmpgtq|crc32|pcmp[ei]str[im])/) n["SSE4.2"]++
+	if (m ~ /^lzcnt/) n["LZCNT (never emulable)"]++
+	if (m ~ /^(andn|bextr|blsi|blsr|blsmsk|bzhi|mulx|pdep|pext|rorx|sarx|shlx|shrx)/) n["BMI1/BMI2"]++
+	if (m ~ /^movbe/) n["MOVBE"]++
+	if (m ~ /^(aes|pclmul|sha1|sha256)/) n["AES/PCLMUL/SHA (legacy enc.)"]++
+	if (m == "cpuid") n["cpuid sites"]++
+}
+END {
+	printf "%10d instructions\n", total
+	for (k in n) printf "%10d %s\n", n[k], k | "sort -k2"
+}'

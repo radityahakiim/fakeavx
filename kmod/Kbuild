@@ -1,0 +1,2 @@
+obj-m := fakeavx.o
+fakeavx-y := main.o core_decode.o core_translate.o core_optable.o core_intdec.o core_region.o

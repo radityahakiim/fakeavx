@@ -1,0 +1,30 @@
+# local test infrastructure (kernel source, QEMU build, downloaded binaries)
+/.kbuild/
+
+# kernel module build
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+.*.cmd
+*.order
+*.symvers
+.tmp_versions/
+
+# helper blob (generated from helpers/)
+/helpers/blob.elf
+/helpers/blob.bin
+/helpers/blob.h
+
+# test programs
+/tests/difftest
+/tests/fuzz
+/tests/regtest
+/tests/guest/guest_test
+/tests/guest/cpuid_test
+
+# editor / misc
+*.swp
+*~
+__pycache__/

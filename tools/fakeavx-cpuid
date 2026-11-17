@@ -1,0 +1,78 @@
+#!/bin/sh
+# fakeavx-cpuid - make CPUID report SSE4.2/POPCNT (and optionally AVX/AVX2) to
+# one program.
+#
+# CPUID cannot be trapped on a Core 2, so the fakeavx module has to be told
+# where a binary's cpuid instructions are. This tool finds them with objdump
+# and registers them. Registration lasts until the module is unloaded.
+#
+#   fakeavx-cpuid add  FILE     find (or reuse cached) sites and register them
+#   fakeavx-cpuid scan FILE     only print the file offsets, one per line
+#   fakeavx-cpuid clear         drop all registered sites
+#
+# Afterwards run the program with FAKEAVX=1 (SSE4.2 + POPCNT reported) or
+# FAKEAVX=avx2 (AVX and AVX2 reported as well).
+set -e
+P=/sys/module/fakeavx/parameters
+
+scan() {
+	f=$1
+	# executable LOAD segments: file offset, virtual address, size in file
+	segs=$(LC_ALL=C readelf -lW "$f" | awk '$1 == "LOAD" && / R?W?E / { print $2, $3, $5 }')
+	[ -n "$segs" ] || { echo "$f: no executable segment found" >&2; exit 1; }
+	LC_ALL=C objdump -d --no-show-raw-insn "$f" |
+	gawk -v segs="$segs" '
+	BEGIN {
+		n = split(segs, s, /[ \n]+/) / 3
+		for (i = 0; i < n; i++) {
+			off[i] = strtonum(s[3 * i + 1]); va[i] = strtonum(s[3 * i + 2]); sz[i] = strtonum(s[3 * i + 3])
+		}
+	}
+	$2 == "cpuid" {
+		a = $1; sub(/:$/, "", a); a = strtonum("0x" a)
+		for (i = 0; i < n; i++)
+			if (a >= va[i] && a < va[i] + sz[i])
+				printf "%x\n", a - va[i] + off[i]
+	}'
+}
+
+write_param() {	# name value
+	if [ -w "$P/$1" ]; then
+		printf '%s\n' "$2" > "$P/$1"
+	else
+		printf '%s\n' "$2" | sudo tee "$P/$1" > /dev/null
+	fi
+}
+
+case "$1" in
+scan)
+	[ -f "$2" ] || { echo "usage: $0 scan FILE" >&2; exit 1; }
+	scan "$2"
+	;;
+add)
+	[ -f "$2" ] || { echo "usage: $0 add FILE" >&2; exit 1; }
+	[ -d "$P" ] || { echo "the fakeavx module is not loaded" >&2; exit 1; }
+	f=$(readlink -f "$2")
+	cache=${XDG_CACHE_HOME:-$HOME/.cache}/fakeavx
+	mkdir -p "$cache"
+	key=$cache/$(basename "$f").$(stat -c '%s.%Y' "$f").sites
+	if [ ! -s "$key" ]; then
+		echo "scanning $f for cpuid instructions (slow for big binaries, cached afterwards)..." >&2
+		scan "$f" > "$key.tmp"
+		mv "$key.tmp" "$key"
+	fi
+	n=0
+	while read -r off; do
+		write_param cpuid_site "$off $f"
+		n=$((n + 1))
+	done < "$key"
+	echo "$n cpuid sites registered for $f"
+	;;
+clear)
+	write_param cpuid_clear 1
+	;;
+*)
+	sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+	exit 1
+	;;
+esac
