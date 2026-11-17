@@ -70,13 +70,17 @@ static bool patch = true;
 module_param(patch, bool, 0644);
 MODULE_PARM_DESC(patch, "overwrite translated instructions with a jump so they stop trapping (default on)");
 
+static bool divert = true;
+module_param(divert, bool, 0644);
+MODULE_PARM_DESC(divert, "patch the instruction before one that cannot be patched itself, if it keeps trapping (default on)");
+
 static bool force;
 module_param(force, bool, 0444);
 MODULE_PARM_DESC(force, "load even if the CPU already supports AVX (for testing only)");
 
 static unsigned long stat_fast, stat_slow, stat_translated, stat_patched, stat_patched_short,
 	stat_patched_int, stat_regions, stat_regions_borrowing, stat_unsupported,
-	stat_short_refused, stat_unpatched;
+	stat_short_refused, stat_unpatched, stat_diverted;
 module_param(stat_fast, ulong, 0444);
 module_param(stat_slow, ulong, 0444);
 module_param(stat_translated, ulong, 0444);
@@ -88,14 +92,21 @@ module_param(stat_regions_borrowing, ulong, 0444);
 module_param(stat_unsupported, ulong, 0444);
 module_param(stat_short_refused, ulong, 0444);
 module_param(stat_unpatched, ulong, 0444);
+module_param(stat_diverted, ulong, 0444);
 
 /* One translated guest instruction. stub == 0: known to be unsupported. */
 struct fa_tr {
 	u64 stub;
 	u8 len;
 	u8 bytes[15];		/* what guest memory holds at this address */
+	u8 dv_tried;		/* fa_divert() has been tried */
+	u32 unp;		/* its entry in /proc/fakeavx/unpatched, if any */
+	atomic_long_t hits;	/* traps since then */
 	struct rcu_head rcu;
 };
+
+/* Unpatched instructions that trap this often get fa_divert() tried. */
+#define FA_DIVERT_HITS	16
 
 struct fa_region {
 	struct list_head list;
@@ -806,19 +817,64 @@ static int fa_patch_site(struct fa_mm *fm, struct fa_tr *tr, unsigned long ip,
  */
 #define FA_UNP	64
 
+/* fa_divert() outcomes, after core/divert.c's own */
+enum {
+	FA_DV_FILE = FA_DV_AMBIG + 1, FA_DV_TAKEN, FA_DV_CHANGED, FA_DV_REGION, FA_DV_PATCH,
+	FA_DV_N
+};
+
+static const char *const fa_dv_why[FA_DV_N] = {
+	[FA_DV_OK] = "diverted",
+	[FA_DV_NOSYNC] = "no function start found before it",
+	[FA_DV_DESYNC] = "decoding from the function start does not reach it",
+	[FA_DV_NOLONG] = "no instruction of 5 bytes or more leads straight to it",
+	[FA_DV_AMBIG] = "function starts disagree on the instructions before it",
+	[FA_DV_FILE] = "its file could not be read",
+	[FA_DV_TAKEN] = "the instruction before it is translated already",
+	[FA_DV_CHANGED] = "the code in memory differs from the file",
+	[FA_DV_REGION] = "the code before it cannot be translated",
+	[FA_DV_PATCH] = "the instruction before it could not be patched",
+};
+
 struct fa_unp {
 	char comm[TASK_COMM_LEN];
 	pid_t pid;
 	char path[128];
 	unsigned long off, ip, lo, hi, heap_lo, heap_hi;
 	u8 bytes[15], len, why;
+	u8 dv;			/* fa_divert() outcome + 1, 0: not tried */
+	long dv_back;		/* bytes before ip it diverted at */
+	u32 seq;
+	atomic_long_t hits;
 };
 
 static struct fa_unp fa_unp[FA_UNP];
-static unsigned int fa_unp_next;
+static u32 fa_unp_seq;
 static DEFINE_SPINLOCK(fa_unp_lock);
 
-static void fa_report_unpatched(struct fa_mm *fm, unsigned long ip, const u8 *bytes, int len,
+/* Count a trap at an instruction reported unpatched. Lock-free, approximate. */
+static void fa_unp_hit(u32 seq)
+{
+	struct fa_unp *u = &fa_unp[seq % FA_UNP];
+
+	if (READ_ONCE(u->seq) == seq)
+		atomic_long_inc(&u->hits);
+}
+
+static void fa_unp_divert(u32 seq, int dv, long back)
+{
+	struct fa_unp *u = &fa_unp[seq % FA_UNP];
+
+	spin_lock(&fa_unp_lock);
+	if (u->seq == seq) {
+		u->dv = dv + 1;
+		u->dv_back = back;
+	}
+	spin_unlock(&fa_unp_lock);
+}
+
+/* Returns the entry's sequence number, for fa_unp_hit(). */
+static u32 fa_report_unpatched(struct fa_mm *fm, unsigned long ip, const u8 *bytes, int len,
 				int why, unsigned long lo, unsigned long hi)
 {
 	struct vm_area_struct *vma;
@@ -850,7 +906,10 @@ static void fa_report_unpatched(struct fa_mm *fm, unsigned long ip, const u8 *by
 	kfree(buf);
 
 	spin_lock(&fa_unp_lock);
-	fa_unp[fa_unp_next++ % FA_UNP] = u;
+	if (!++fa_unp_seq)
+		fa_unp_seq = 1;
+	u.seq = fa_unp_seq;
+	fa_unp[u.seq % FA_UNP] = u;
 	spin_unlock(&fa_unp_lock);
 
 	if (lo)
@@ -861,24 +920,30 @@ static void fa_report_unpatched(struct fa_mm *fm, unsigned long ip, const u8 *by
 		pr_info_ratelimited("%s[%d] %s+%#lx: %d-byte instruction %*ph not patched, traps every time: %s\n",
 				    u.comm, u.pid, u.path, u.off, u.len, u.len, u.bytes,
 				    fa_why[why]);
+	return u.seq;
 }
 
 static int fa_unp_show(struct seq_file *m, void *v)
 {
 	unsigned int i, n;
 
-	seq_puts(m, "# program[pid] file+offset bytes: reason [stub window] [heap]\n");
+	seq_puts(m, "# program[pid] file+offset bytes: traps since; reason [stub window] [heap]; diverted?\n");
 	spin_lock(&fa_unp_lock);
-	n = min(fa_unp_next, (unsigned int)FA_UNP);
+	n = min(fa_unp_seq, (u32)FA_UNP);
 	for (i = 0; i < n; i++) {
-		const struct fa_unp *u = &fa_unp[(fa_unp_next - n + i) % FA_UNP];
+		const struct fa_unp *u = &fa_unp[(fa_unp_seq - n + 1 + i) % FA_UNP];
 
-		seq_printf(m, "%s[%d] %s+%#lx %*ph: %s", u->comm, u->pid, u->path, u->off,
-			   u->len, u->bytes, fa_why[u->why]);
+		seq_printf(m, "%s[%d] %s+%#lx %*ph: %ld traps; %s", u->comm, u->pid, u->path,
+			   u->off, u->len, u->bytes, atomic_long_read(&u->hits), fa_why[u->why]);
 		if (u->lo)
 			seq_printf(m, " [window %#lx-%#lx] [heap %#lx-%#lx, window starts %+ld MB from heap end]",
 				   u->lo, u->hi, u->heap_lo, u->heap_hi,
 				   ((long)u->lo - (long)u->heap_hi) / (1L << 20));
+		if (u->dv == FA_DV_OK + 1)
+			seq_printf(m, "; diverted %ld bytes before it, at +%#lx", u->dv_back,
+				   u->off - u->dv_back);
+		else if (u->dv)
+			seq_printf(m, "; not diverted: %s", fa_dv_why[u->dv - 1]);
 		seq_putc(m, '\n');
 	}
 	spin_unlock(&fa_unp_lock);
@@ -954,6 +1019,7 @@ static struct fa_tr *fa_make_entry(struct fa_mm *fm, struct fa_region *main,
 	u8 stub[FA_ENTRY_MAX], cur[5];
 	struct fa_tr *tr;
 	int n, why = FW_OK;
+	u32 unp = 0;
 
 	/* what follows may have been patched since the region was read */
 	if (want_patch && copy_from_user(cur, (void __user *)ip, 5))
@@ -968,12 +1034,13 @@ static struct fa_tr *fa_make_entry(struct fa_mm *fm, struct fa_region *main,
 		memcpy(&fixed, cur + it->len, 5 - it->len);
 		lo = ip + 5 + (long)(s32)(fixed << shift);
 		r = fa_window_get(fm, lo, lo + (1UL << shift), &addr, &why);
-		if (!r) {
+		if (!r && it->kind == FA_R_OURS) {
 			stat_short_refused++;	/* will trap on every execution */
-			fa_report_unpatched(fm, ip, it->bytes, it->len, why, lo,
-					    lo + (1UL << shift));
-			want_patch = false;
+			unp = fa_report_unpatched(fm, ip, it->bytes, it->len, why, lo,
+						  lo + (1UL << shift));
 		}
+		if (!r)
+			want_patch = false;
 	}
 	if (!r && !map) {
 		addr = target;		/* nothing to set up: enter the body directly */
@@ -994,9 +1061,11 @@ static struct fa_tr *fa_make_entry(struct fa_mm *fm, struct fa_region *main,
 		return NULL;
 	if (want_patch) {
 		why = fa_patch_site(fm, tr, ip, cur);
-		if (why)
-			fa_report_unpatched(fm, ip, it->bytes, it->len, why, 0, 0);
+		/* an integer instruction that is not patched just keeps running as it is */
+		if (why && it->kind == FA_R_OURS)
+			unp = fa_report_unpatched(fm, ip, it->bytes, it->len, why, 0, 0);
 	}
+	tr->unp = unp;
 	return tr;
 }
 
@@ -1009,12 +1078,32 @@ static bool fa_is_ours(unsigned long ip)
 	return n && !fa_decode(buf, n, ip, &in) && in.kind != FA_K_XGETBV;
 }
 
+/* Does the first block of the region run straight from its entry into ip? */
+static bool fa_rgn_reaches(const struct fa_rgn *rg, unsigned long ip)
+{
+	int k;
+
+	for (k = 0; k < rg->n; k++) {
+		const struct fa_ritem *it = &rg->it[k];
+
+		if (it->ip == ip)
+			return it->kind == FA_R_OURS;
+		if (it->has_link || k + 1 == rg->n || it->ip + it->len != rg->it[k + 1].ip)
+			return false;
+	}
+	return false;
+}
+
 /*
  * Translate the code around ip as a region (see core/region.c) and hook its
  * instructions up. Returns the translation record for ip.
+ *
+ * With via, the region starts there instead, at an instruction that falls
+ * through to ip, which is translated already (see fa_divert()). Returns the
+ * record for via, or NULL if the region does not run into ip.
  */
 static struct fa_tr *fa_translate_region(struct fa_mm *fm, unsigned long ip,
-					 const u8 *buf, int nread)
+					 const u8 *buf, int nread, unsigned long via)
 {
 	static const struct { u8 max_items, no_map; } tries[] = {
 		{ 0, 0 }, { 0, 1 }, { 1, 1 },
@@ -1022,7 +1111,7 @@ static struct fa_tr *fa_translate_region(struct fa_mm *fm, unsigned long ip,
 	struct fa_region *main = fa_region_get(fm, ip);
 	struct fa_rgn *rg = fm->rg;
 	u8 order[FA_RG_ITEMS];
-	unsigned long addr;
+	unsigned long addr, fresh = via ? 0 : ip;	/* gets an entry even if known */
 	int i, j, cand, ret = -1;
 
 	if (!main)
@@ -1033,7 +1122,7 @@ static struct fa_tr *fa_translate_region(struct fa_mm *fm, unsigned long ip,
 	for (i = 0; i < ARRAY_SIZE(tries) && ret < 0; i++) {
 		rg->read = fa_rd;
 		rg->ctx = NULL;
-		rg->entry_ip = ip;
+		rg->entry_ip = via ?: ip;
 		rg->out = fm->buf;
 		rg->cap = FA_BODY_MAX;
 		rg->out_addr = addr;
@@ -1044,7 +1133,9 @@ static struct fa_tr *fa_translate_region(struct fa_mm *fm, unsigned long ip,
 		rg->no_sse41 = no_sse41;
 		ret = fa_region_build(rg);
 	}
-	if (ret < 0 || rg->it[0].kind != FA_R_OURS)
+	if (via && (ret < 0 || !fa_rgn_reaches(rg, ip)))
+		return NULL;
+	if (!via && (ret < 0 || rg->it[0].kind != FA_R_OURS))
 		return fa_tr_store(fm, ip, 0, buf, min(nread, 15));
 	if (fa_poke(addr, fm->buf, rg->len))
 		return NULL;
@@ -1068,12 +1159,12 @@ static struct fa_tr *fa_translate_region(struct fa_mm *fm, unsigned long ip,
 		const struct fa_ritem *it = &rg->it[order[i]];
 		bool may_patch = true;
 
-		if (it->kind != FA_R_OURS || (it->ip != ip && xa_load(&fm->tr, it->ip)))
+		if (it->kind != FA_R_OURS || (it->ip != fresh && xa_load(&fm->tr, it->ip)))
 			continue;
 		if (it->len < 5 && !xa_load(&fm->tr, it->ip + it->len) &&
 		    fa_is_ours(it->ip + it->len)) {
 			/* its successor is not settled yet: leave it for a later trap */
-			if (it->ip != ip)
+			if (it->ip != fresh)
 				continue;
 			may_patch = false;
 		}
@@ -1106,7 +1197,74 @@ static struct fa_tr *fa_translate_region(struct fa_mm *fm, unsigned long ip,
 			cand = -2;
 		}
 	}
-	return xa_load(&fm->tr, ip);
+	return xa_load(&fm->tr, via ?: ip);
+}
+
+/*
+ * The instruction at ip (translated, record tr) could not be patched and
+ * keeps trapping. Patch the instruction before it instead, if that one is
+ * long enough and certainly an instruction (see core/divert.c), with a jump
+ * to a region that runs both. Called with fm->lock held.
+ */
+#define FA_DV_SPAN	(64 << 10)
+
+static int fa_divert(struct fa_mm *fm, unsigned long ip, struct fa_tr *tr)
+{
+	struct vm_area_struct *vma;
+	struct file *file = NULL;
+	unsigned long base = 0, end = 0;
+	loff_t pos = 0;
+	u64 x;
+	u8 *buf, mem[FA_DV_BACK];
+	int n = 0, ret;
+	struct fa_tr *xt;
+
+	mmap_read_lock(fm->mm);
+	vma = vma_lookup(fm->mm, ip);
+	if (vma && vma->vm_file && !(vma->vm_flags & (VM_WRITE | VM_SHARED))) {
+		file = get_file(vma->vm_file);
+		base = max(vma->vm_start, ip > FA_DV_SPAN ? ip - FA_DV_SPAN : 0);
+		end = min(vma->vm_end, ip + 32);
+		pos = (vma->vm_pgoff << PAGE_SHIFT) + (base - vma->vm_start);
+	}
+	mmap_read_unlock(fm->mm);
+	if (!file)
+		return FA_DV_FILE;
+	buf = kvmalloc(end - base, GFP_KERNEL);
+	if (buf)
+		n = kernel_read(file, buf, end - base, &pos);
+	fput(file);
+	if (n <= 0 || ip + tr->len > base + n) {
+		kvfree(buf);
+		return FA_DV_FILE;
+	}
+
+	ret = fa_find_divert(buf, base, n, ip, &x);
+	if (ret)
+		goto out;
+	ret = FA_DV_TAKEN;
+	if (xa_load(&fm->tr, x))
+		goto out;
+	/* what will run must be what was decoded */
+	ret = FA_DV_CHANGED;
+	if (ip - x > sizeof(mem) || copy_from_user(mem, (void __user *)x, ip - x) ||
+	    memcmp(mem, buf + (x - base), ip - x) ||
+	    memcmp(tr->bytes, buf + (ip - base), tr->len))
+		goto out;
+	ret = FA_DV_REGION;
+	xt = fa_translate_region(fm, ip, NULL, 0, x);
+	if (!xt)
+		goto out;
+	ret = FA_DV_PATCH;
+	if (xt->bytes[0] != 0xe9)
+		goto out;
+	ret = FA_DV_OK;
+	stat_diverted++;
+out:
+	kvfree(buf);
+	if (tr->unp)
+		fa_unp_divert(tr->unp, ret, ret ? 0 : ip - x);
+	return ret;
 }
 
 /*
@@ -1161,7 +1319,7 @@ static void fa_slow(struct pt_regs *regs)
 			}
 			goto out;
 		}
-		tr = fa_translate_region(fm, ip, buf, n);
+		tr = fa_translate_region(fm, ip, buf, n, 0);
 		if (!tr) {
 			force_sig(SIGILL);
 			goto out;
@@ -1174,6 +1332,11 @@ static void fa_slow(struct pt_regs *regs)
 	}
 	if (!tr->stub)
 		goto out;
+	if (tr->unp && !tr->dv_tried && atomic_long_read(&tr->hits) >= FA_DIVERT_HITS &&
+	    divert && patch) {
+		tr->dv_tried = 1;
+		fa_divert(fm, ip, tr);
+	}
 	if (!fa_thread_setup(fm)) {
 		if (fm->enabled)
 			force_sig(SIGILL);
@@ -1210,6 +1373,13 @@ static int fa_die(struct notifier_block *nb, unsigned long val, void *data)
 			if (!tr->stub)
 				return NOTIFY_DONE;	/* genuinely unsupported: SIGILL */
 			if (fa_gs_read()) {
+				if (tr->unp) {
+					/* reported unpatched: count, and try fa_divert() at some point */
+					fa_unp_hit(tr->unp);
+					if (atomic_long_inc_return(&tr->hits) >= FA_DIVERT_HITS &&
+					    !READ_ONCE(tr->dv_tried) && READ_ONCE(divert) && patch)
+						goto slow;
+				}
 				regs->ip = tr->stub;
 				stat_fast++;
 				return NOTIFY_STOP;
@@ -1224,6 +1394,7 @@ static int fa_die(struct notifier_block *nb, unsigned long val, void *data)
 	 * notifier_call_chain() stop without looking at the chain again, and
 	 * because fa_inflight keeps the module around (see fa_exit()).
 	 */
+slow:
 	atomic_inc(&fa_inflight);
 	rcu_read_unlock();
 	local_irq_enable();

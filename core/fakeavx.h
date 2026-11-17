@@ -214,6 +214,13 @@ int fa_emit_entry(u8 *out, u64 at, const struct fa_regmap *map, u64 target);
 /* Length of the instruction at p (lendec.c): 1 for an invalid opcode, 0 if truncated. */
 int fa_insn_len(const u8 *p, u32 avail);
 
+/* divert.c: where to divert ahead of an instruction that cannot be patched */
+#define FA_DV_BACK	64	/* how far before it the diversion point may be */
+enum {
+	FA_DV_OK, FA_DV_NOSYNC, FA_DV_DESYNC, FA_DV_NOLONG, FA_DV_AMBIG,
+};
+int fa_find_divert(const u8 *buf, u64 base, u32 n, u64 ip, u64 *x);
+
 /* ---- op table, shared with the helper blob and the tests ---- */
 
 enum fa_shape {

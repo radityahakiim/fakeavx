@@ -36,6 +36,7 @@ touched at all.
 | `tests/regtest.c` | Region test: whole test functions run as translated regions vs. a C reference. Needs an AVX2 machine. |
 | `tests/intdec_check.py` | Checks the integer-instruction decoder against Capstone. |
 | `tests/ssedec_check.py` | Checks the legacy SSE/MMX decoder (instructions regions copy as they are) against Capstone, including implicit register use. |
+| `tests/divert_check.c` | Checks where `fa_find_divert()` decides an instruction starts against objdump's disassembly of a whole executable (`make -C tests divert-check BIN=...`). |
 | `tests/fuzz.c` | ASan/UBSan fuzz of decoders, translator and region builder. |
 | `tests/guest/` | End-to-end test program to run on the AVX-less machine. |
 | `tests/qemu/run.sh` | Boots a kernel in QEMU with a Penryn CPU model and runs the end-to-end test. |
@@ -95,17 +96,31 @@ Module parameters (`/etc/modprobe.d/fakeavx.conf`, or
 |---|---|---|
 | `policy` | 1 | 1: every process unless it has `FAKEAVX=0`. 0: only processes started with `FAKEAVX=1`. |
 | `patch` | 1 | Overwrite translated instructions with a jump. 0 traps on every execution (slow; for debugging). |
+| `divert` | 1 | When an instruction that could not be patched keeps trapping, patch the instruction before it instead (below). |
 | `autocpuid` | 1 | Find a binary's `cpuid` instructions automatically (below). |
-| `stat_*` | — | Read-only counters, e.g. `stat_slow` (first-time traps), `stat_fast` (repeat traps), `stat_regions`, `stat_patched`, `stat_cpuid`, `stat_scans`, `stat_unsupported`, `stat_short_refused` (3-4 byte instructions left trapping because their stub window was unavailable), `stat_unpatched` (all instructions left trapping, for any reason). |
+| `stat_*` | — | Read-only counters, e.g. `stat_slow` (first-time traps), `stat_fast` (repeat traps), `stat_regions`, `stat_patched`, `stat_cpuid`, `stat_scans`, `stat_unsupported`, `stat_short_refused` (3-4 byte instructions left trapping because their stub window was unavailable), `stat_unpatched` (all instructions left trapping, for any reason), `stat_diverted` (of those, how many were then diverted at the instruction before). |
 
 `stat_fast` is the number to watch: every count is a full kernel round trip.
 If it keeps climbing while a program runs, that program has hot instructions
 that could not be patched (see limitations). Each instruction that should
 have been patched but was not is logged with the program, file and offset,
 its bytes and the reason (`dmesg | grep fakeavx`, rate limited), and the last
-64 are kept in `/proc/fakeavx/unpatched`, with the stub window and the heap
-position where that matters. Unsupported instructions are logged with their
-bytes too.
+64 are kept in `/proc/fakeavx/unpatched`, with the number of times each has
+trapped since, the stub window and the heap position where that matters.
+Unsupported instructions are logged with their bytes too.
+
+Once such an instruction has trapped 16 times, fakeavx tries to patch the
+instruction before it instead: if that one is at least 5 bytes long and leads
+straight into it, a jump there enters a translated copy that runs both, so
+the traps stop for every path through it. The line in
+`/proc/fakeavx/unpatched` then ends in `diverted N bytes before it`, or says
+why not. This needs to know for certain where the previous instruction
+starts, which x86 code does not say; fakeavx decodes forward from the three
+nearest function starts (recognised by the int3 padding LLVM puts between
+functions) and uses the answer only if all three agree. Checked against
+objdump over Claude Code, Bun and Node: 23,670 answers, none wrong. In
+Claude Code 2.1.326, 8 of the 10 instructions reported on the T61 qualify;
+the other two follow a `call` or start a block, and still trap.
 
 ## CPUID
 
@@ -253,9 +268,11 @@ register, and prints both values when they differ.
   patched: the stub would have to sit about 0.4–1 GB below the instruction,
   which for an executable loaded at 0x400000 does not exist. Regions mostly
   hide this — the loop runs in the cache, and where possible an earlier
-  integer instruction is patched instead — but an unpatchable instruction at
-  the head of a frequently called function still traps once per call. Watch
-  `stat_fast`; building with `-fPIE -pie` or `-static-pie` avoids it.
+  integer instruction is patched instead (including one before the region,
+  see `divert`) — but an unpatchable instruction at the head of a frequently
+  called function, or right after a `call`, still traps once per call. Watch
+  `/proc/fakeavx/unpatched`; building with `-fPIE -pie` or `-static-pie`
+  avoids it. Claude Code is such an executable (loaded at 0x200000).
 - **Signal handlers that run AVX code.** While a region runs, borrowed
   registers and upper halves live in per-thread scratch memory. A handler
   that itself executes translated AVX code reuses that memory and corrupts the
@@ -310,6 +327,8 @@ and extra arguments are passed to `insmod` (e.g. `./run.sh patch=0`).
 | Short patches no longer depend on where ASLR puts the heap (10 runs, heap 114-913 MB above the program) | QEMU, `-cpu Penryn` | all patched, `stat_short_refused` 0 (before: 6 of 10 trapping) |
 | Legacy SSE4.1 inside regions runs natively; differential test with borrowed registers around it | development machine, QEMU | 1.18 M instances per mode, 0 mismatches |
 | Unpatched instructions reported with program, file+offset and reason (`tests/guest/unpatched_test`) | QEMU | reported, result correct |
+| Per-instruction trap counts in `/proc/fakeavx/unpatched`; diversion at the instruction before (`tests/guest/unpatched_test`, 100,000 calls) | QEMU, both CPU models | diverted after 16 traps, result correct; with `divert=0` 99,999 traps (test fails, as it should) |
+| Diversion point vs. objdump (`tests/divert_check.c`): Claude Code 2.1.326, Bun, Node | development machine | 23,670 answers, 0 wrong; with only one function start, 2 wrong (hence three) |
 | Legacy SSE/SSE2/SSE3/SSSE3/MMX carried inside regions: decoder vs. Capstone (393,000 accepted, 309,000 from real code incl. Bun and Claude Code); region test `mixsse` with borrowed registers | development machine | 0 divergences; pass (and fails when the register accounting is removed) |
 | Inline `vpcmpgtq`, `vptest ymm`, `vtestps/pd`, variable shifts, and a table-driven `crc32` routine instead of the C helper | development machine (1.18 M differential instances, mutation-checked), QEMU both CPU models (`fakeavx-prof --check` 198/198) | 0 mismatches |
 | `fakeavx-prof --check`: 198 instruction forms bit-exact against real AVX2 through the module | QEMU, `-cpu Penryn` and `-cpu core2duo` | 198/198 match, none trapping after translation |

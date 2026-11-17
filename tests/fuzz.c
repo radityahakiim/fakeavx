@@ -89,6 +89,37 @@ static int fuzz_regions(long iters)
 	return 0;
 }
 
+/*
+ * fa_find_divert() on random code with int3 padding sprinkled in: no reads
+ * outside the buffer (ASan), and any answer is a boundary of its own sweep
+ * that lies before ip.
+ */
+static int fuzz_divert(long iters)
+{
+	long found = 0;
+
+	for (long i = 0; i < iters; i++) {
+		u32 n = 256 + rnd() % 4096, k;
+		u8 *buf = malloc(n);
+		u64 base = 0x400000 + (rnd() % 64), ip, x;
+
+		for (k = 0; k < n; k++)
+			buf[k] = (rnd() % 8) ? rnd() : 0xcc;
+		ip = base + rnd() % n;
+		if (!fa_find_divert(buf, base, n, ip, &x)) {
+			found++;
+			if (x >= ip || ip - x > FA_DV_BACK || x < base) {
+				printf("divert answer %#llx for ip %#llx\n", (unsigned long long)x,
+				       (unsigned long long)ip);
+				return 1;
+			}
+		}
+		free(buf);
+	}
+	printf("%ld divert searches, %ld found\n", iters, found);
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	long iters = argc > 1 ? atol(argv[1]) : 5000000, ok = 0, tr = 0, maxlen = 0;
@@ -142,5 +173,7 @@ int main(int argc, char **argv)
 		free(out);
 	}
 	printf("%ld inputs, %ld decoded, %ld translated, longest stub %ld bytes\n", iters, ok, tr, maxlen);
+	if (fuzz_divert(iters / 1000))
+		return 1;
 	return fuzz_regions(iters / 20);
 }

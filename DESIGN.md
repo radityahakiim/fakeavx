@@ -486,6 +486,27 @@ changed, ...) is reported with its program, file and offset, bytes and
 reason, in dmesg and in `/proc/fakeavx/unpatched`, and counted in
 `stat_unpatched`.
 
+**Diverting ahead of an unpatchable instruction.** The T61 report for Claude
+Code 2.1.326 showed ten `popcnt reg, reg` (4 bytes) left trapping. Claude Code
+is a non-PIE executable at 0x200000; the byte after each `popcnt` put its stub
+window either ~2 GB lower, below address 0 (`cmp`, `mov`: 0x83, 0x89), or
+16 MB higher, inside its own code (`add`: 0x01). No placement can fix these.
+What can: patching the instruction before, when it is 5 bytes or longer and
+falls through to the trapping one (core/divert.c, fa_divert()). Only that
+instruction is overwritten, so jumps to anything after it still find the
+original bytes. The difficulty is knowing where that instruction starts.
+Unwind tables would give function starts, but Bun's Zig code has none (3,224
+FDEs covering 2.1 of 113 MB). So decoding starts at the int3-padded 16-byte
+boundaries LLVM leaves between functions; the nearest must decode exactly to
+the trapping instruction, and the next two must agree on the candidate.
+objdump's linear disassembly of the whole `.text` served as the reference: 0
+wrong of 23,670 with three starts, 2 wrong with one, 485 wrong when any
+16-byte boundary counts as a function start. The decoding uses the file's
+bytes, since memory holds earlier patches that change instruction lengths,
+and memory must match the file before anything is written. It runs only for
+reported instructions that keep trapping (16 times), and each trap of those
+is counted, so `/proc/fakeavx/unpatched` shows which ones cost anything.
+
 **Policy.** Every process is handled by default (`policy=1`); `FAKEAVX=0` in
 the environment opts a program out.
 

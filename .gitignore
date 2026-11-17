@@ -30,3 +30,5 @@
 *~
 __pycache__/
 /tools/prof/fakeavx-prof
+/tests/divert_check
+/tests/divert_truth.txt

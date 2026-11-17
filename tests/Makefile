@@ -1,7 +1,7 @@
 CC ?= gcc
 CFLAGS := -O1 -g -Wall -Wno-unused-function
 CORE := ../core/decode.c ../core/translate.c ../core/optable.c ../core/intdec.c ../core/region.c \
-	../core/ssedec.c
+	../core/ssedec.c ../core/lendec.c ../core/divert.c
 
 all: difftest
 ../helpers/blob.h: ../helpers/helper.c ../helpers/entry.S ../core/fakeavx.h
@@ -20,5 +20,11 @@ check: difftest fuzz regtest
 	FA_FAR=1 ./difftest 100
 	FA_NOSSE41=1 ./difftest 100
 	./fuzz 3000000
+# fa_find_divert() against objdump, on any x86-64 executable: make divert-check BIN=...
+divert_check: divert_check.c $(CORE) ../core/fakeavx.h
+	$(CC) $(CFLAGS) -o $@ divert_check.c $(CORE)
+divert-check: divert_check
+	objdump -d --insn-width=16 -j .text $(BIN) | awk -f divert_truth.awk > divert_truth.txt
+	./divert_check $(BIN) divert_truth.txt
 clean:
-	rm -f difftest fuzz regtest
+	rm -f difftest fuzz regtest divert_check divert_truth.txt
