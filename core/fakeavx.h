@@ -42,6 +42,7 @@ typedef int64_t s64;
 /* Helper blob entry points (offsets from blob base). */
 #define FA_BLOB_HELPER	0x00
 #define FA_BLOB_POPCNT	0x08
+#define FA_BLOB_CRC32	0x10
 
 #define FA_MAX_STUB	512	/* upper bound for one translated instruction */
 
@@ -117,6 +118,9 @@ int fa_decode(const u8 *code, u32 avail, u64 rip, struct fa_insn *in);
  */
 int fa_translate(const struct fa_insn *in, const struct fa_env *env);
 
+/* Scratch xmm registers its translation may need (2, or 3 for the inline sequences). */
+int fa_scratch_needed(const struct fa_insn *in, int no_sse41);
+
 /* Emit "jmp target" at guest address `at`. Returns its length (5 or 14). */
 int fa_emit_jmp(u8 *out, u64 at, u64 target);
 #define FA_JMP_MAX	14
@@ -144,6 +148,12 @@ struct fa_int {
 int fa_decode_int(const u8 *code, u32 avail, u64 ip, struct fa_int *o);
 
 /*
+ * Legacy SSE/SSE2/SSE3/SSSE3/MMX instructions a region can copy (ssedec.c):
+ * like fa_decode_int(), plus *xmm = the xmm registers it may use.
+ */
+int fa_decode_sse(const u8 *code, u32 avail, u64 ip, struct fa_int *o, u16 *xmm);
+
+/*
  * Regions (region.c): the code reachable from one entry point through direct
  * branches, translated as a unit so that loops run entirely in the cache.
  */
@@ -161,6 +171,7 @@ struct fa_ritem {
 	u64 link;	/* if has_link: control continues at this guest address  */
 	u32 off;	/* offset of this instruction's translation in the body  */
 	u8 kind, len, cc, disp_off, has_link, nread;
+	u16 xmm;	/* FA_R_PLAIN: xmm registers it uses (legacy SSE) */
 	u8 bytes[15];
 	struct fa_insn in;	/* FA_R_OURS only */
 };

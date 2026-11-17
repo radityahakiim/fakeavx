@@ -55,6 +55,7 @@ static const struct { const char *name; kfn ref, avx; } kernels[] = {
 	{ "float", ref_float, avx_float }, { "double", ref_double, avx_double },
 	{ "int", ref_int, avx_int }, { "bytes", ref_bytes, avx_bytes },
 	{ "popcnt", ref_popcnt, avx_popcnt }, { "simd", ref_simd, avx_simd },
+	{ "mixsse", ref_mixsse, avx_mixsse },
 };
 
 int main(void)

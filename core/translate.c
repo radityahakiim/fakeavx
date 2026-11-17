@@ -1119,6 +1119,52 @@ static void do_popcnt(struct ctx *c)
 	}
 }
 
+/*
+ * Legacy crc32 (SSE4.2): eax = crc, edx = data, ecx = byte count, then the
+ * table-driven routine in the helper blob, instead of the generic C helper.
+ * rax, rcx and rdx are kept in gpr spill slots 0, 1 and 3 (slot 2 may hold a
+ * scratch register for an unreachable rip-relative operand) and are read
+ * from there once they have been overwritten.
+ */
+static void do_crc32(struct ctx *c)
+{
+	const struct fa_insn *in = c->in;
+	int D = in->reg, size = in->opcode == 0xf0 ? 1 : in->W ? 8 : in->opsize16 ? 2 : 4;
+	struct opnd src = is_mem(c) ? MEM(0) : REG(in->rm);
+	static const s8 slot[3] = { 0, 1, 3 };
+	int r;
+
+	if (c->ng > 1) {
+		c->err = 1;
+		return;
+	}
+	for (r = 0; r < 3; r++)
+		gpr_gs(c, 1, r, slot[r]);
+	/* data, zero-extended, into rdx: nothing has been overwritten yet */
+	if (size == 1) {
+		if (in->rex && !is_mem(c) && in->rm >= 4 && in->rm < 8)
+			put(c, 0x40);		/* spl..dil, not ah..bh */
+		emit(c, 0, 1, 0xb6, 2, src, 0, -1);	/* movzx edx, r/m8 */
+	} else if (size == 2) {
+		emit(c, 0, 1, 0xb7, 2, src, 0, -1);	/* movzx edx, r/m16 */
+	} else {
+		emit(c, 0, 0, 0x8b, 2, src, size == 8, -1);	/* mov (e|r)dx, r/m */
+	}
+	/* crc into eax (rdx is no longer the guest's) */
+	emit(c, 0, 0, 0x8b, 0, D == 2 ? GS(FA_ST_GTMP + 8 * slot[2]) : REG(D), 0, -1);
+	put(c, 0xb9);				/* mov ecx, size */
+	put32(c, size);
+	put(c, 0x48); put(c, 0x8d); put(c, 0x64); put(c, 0x24); put(c, 0x80);
+	emit_call_blob(c, FA_BLOB_CRC32);
+	put(c, 0x48); put(c, 0x8d); put(c, 0xa4); put(c, 0x24); put32(c, 128);
+	/* result: 32 bits, zero-extended into the destination */
+	if (D != 0)
+		emit(c, 0, 0, 0x89, 0, REG(D), 0, -1);	/* mov D32, eax */
+	for (r = 0; r < 3; r++)
+		if (r != D)
+			gpr_gs(c, 0, r, slot[r]);
+}
+
 /* Rewrite an unreachable RIP-relative operand as [scratch gpr]. */
 static void fix_riprel(struct ctx *c, u16 avoid)
 {
@@ -1162,6 +1208,204 @@ static void do_native(struct ctx *c)
 	     in->has_imm ? in->imm : -1);
 }
 
+/*
+ * Inline replacements for instructions that used to go through the C helper.
+ * A helper call saves and restores every register, the flags and MXCSR, and
+ * decodes the instruction again: hundreds of cycles. These sequences work a
+ * 128-bit lane at a time, with at most three scratch registers, and use only
+ * SSE operations, which leave EFLAGS alone (ptest sets exactly the flags the
+ * guest instruction sets).
+ */
+
+/* lane l (0: bits 127:0, 1: bits 255:128) of guest register r into host register T */
+static void lane_reg(struct ctx *c, int T, int r, int l)
+{
+	if (l)
+		load_gs(c, T, HI(r));
+	else
+		mov_rr(c, T, r);
+}
+
+/* lane l of the rm operand, register or (unaligned) memory, into T */
+static void lane_rm(struct ctx *c, int T, int l)
+{
+	if (is_mem(c))
+		loadu(c, T, 16 * l);
+	else
+		lane_reg(c, T, c->in->rm, l);
+}
+
+static struct opnd lane_opnd(struct ctx *c, int r, int l)
+{
+	return l ? HI(r) : REG(r);
+}
+
+/* 66 0F op */
+static void sse2(struct ctx *c, int opc, int d, struct opnd s, int imm)
+{
+	emit(c, 0x66, 1, opc, d, s, 0, imm);
+}
+
+/* write a lane result held in T */
+static void lane_out(struct ctx *c, int T, int l)
+{
+	if (l)
+		store_gs(c, T, HI(c->in->reg));
+	else
+		mov_rr(c, c->in->reg, T);
+}
+
+/*
+ * vpcmpgtq: a > b (signed) is the sign of (b & ~a) | (~(a ^ b) & (b - a)),
+ * exact even where b - a overflows; then spread the sign over the qword.
+ */
+static void do_pcmpgtq(struct ctx *c)
+{
+	int A = c->in->vvvv, l, T1 = xscratch(c), T2 = xscratch(c), T3 = xscratch(c);
+
+	for (l = c->in->L; l >= 0; l--) {
+		struct opnd a = lane_opnd(c, A, l);
+
+		lane_rm(c, T1, l);			/* b */
+		mov_rr(c, T3, T1);			/* b */
+		sse2(c, 0xfb, T1, a, -1);		/* psubq: b - a */
+		lane_reg(c, T2, A, l);
+		sse2(c, 0xef, T2, REG(T3), -1);		/* pxor: a ^ b */
+		sse2(c, 0xdf, T2, REG(T1), -1);		/* pandn: ~(a ^ b) & (b - a) */
+		lane_reg(c, T1, A, l);
+		sse2(c, 0xdf, T1, REG(T3), -1);		/* pandn: ~a & b */
+		sse2(c, 0xeb, T1, REG(T2), -1);		/* por */
+		sse2(c, 0x72, 4, REG(T1), 31);		/* psrad $31 */
+		sse2(c, 0x70, T1, REG(T1), 0xf5);	/* pshufd: high dword to both */
+		lane_out(c, T1, l);
+	}
+	if (!c->in->L)
+		zero_hi(c, c->in->reg);
+}
+
+/*
+ * vptest (256-bit), vtestps, vtestpd: ZF = (src1 & src2) == 0 and
+ * CF = (~src1 & src2) == 0 over all lanes (only the sign bits for vtest).
+ * Both are folded into one register, z in the low qword and c in the high
+ * one, and a single ptest against "low qword set" yields both flags.
+ */
+static void do_vtest(struct ctx *c, int bits)	/* 0: all, 32 / 64: sign bits */
+{
+	int S = c->in->reg, l, T1 = xscratch(c), T2 = xscratch(c), T3 = xscratch(c);
+
+	for (l = c->in->L; l >= 0; l--) {
+		struct opnd a = lane_opnd(c, S, l);
+		int and = l == c->in->L ? T1 : T3;
+
+		lane_rm(c, and, l);
+		sse2(c, 0xdb, and, a, -1);		/* pand: src1 & src2 */
+		if (and != T1)
+			sse2(c, 0xeb, T1, REG(T3), -1);
+		lane_rm(c, T3, l);
+		sse2(c, 0xeb, T3, a, -1);		/* por */
+		sse2(c, 0xef, T3, a, -1);		/* pxor: (s1 | s2) ^ s1 = ~s1 & s2 */
+		if (l == c->in->L)
+			mov_rr(c, T2, T3);
+		else
+			sse2(c, 0xeb, T2, REG(T3), -1);
+	}
+	if (bits == 32) {
+		sse2(c, 0x72, 2, REG(T1), 31);		/* psrld $31 */
+		sse2(c, 0x72, 2, REG(T2), 31);
+	} else if (bits == 64) {
+		sse2(c, 0x73, 2, REG(T1), 63);		/* psrlq $63 */
+		sse2(c, 0x73, 2, REG(T2), 63);
+	}
+	mov_rr(c, T3, T1);
+	sse2(c, 0x6c, T3, REG(T2), -1);			/* punpcklqdq: [z.lo, c.lo] */
+	sse2(c, 0x6d, T1, REG(T2), -1);			/* punpckhqdq: [z.hi, c.hi] */
+	sse2(c, 0xeb, T1, REG(T3), -1);			/* por */
+	sse2(c, 0x76, T2, REG(T2), -1);			/* pcmpeqd: all ones */
+	sse2(c, 0x73, 3, REG(T2), 8);			/* psrldq $8: low qword set */
+	emit(c, 0x66, 2, 0x17, T2, REG(T1), 0, -1);	/* ptest */
+}
+
+/*
+ * vpsllvd/q, vpsrlvd/q, vpsravd: each element shifted by its own count. The
+ * xmm-count forms of the SSE shifts take a 64-bit count and already give 0
+ * (or the sign, for psrad) for counts past the element width, as AVX2 does;
+ * so each count is zero-extended into its own register, the whole lane
+ * shifted by it, and the one element kept with pblendw.
+ */
+static void do_varshift(struct ctx *c)
+{
+	const struct fa_insn *in = c->in;
+	int A = in->vvvv, q = in->W, l, i;
+	int opc = in->opcode == 0x47 ? (q ? 0xf3 : 0xf2) :	/* psllq / pslld */
+		  in->opcode == 0x45 ? (q ? 0xd3 : 0xd2) : 0xe2;	/* psrlq / psrld, psrad */
+	int R = xscratch(c), T = xscratch(c), S = xscratch(c);
+
+	for (l = in->L; l >= 0; l--) {
+		for (i = 0; i < (q ? 2 : 4); i++) {
+			int dst = i ? S : R;
+
+			lane_rm(c, T, l);			/* counts */
+			if (i)
+				sse2(c, 0x73, 3, REG(T), (q ? 8 : 4) * i);	/* psrldq */
+			if (!q)
+				emit(c, 0x66, 2, 0x35, T, REG(T), 0, -1);	/* pmovzxdq */
+			lane_reg(c, dst, A, l);
+			sse2(c, opc, dst, REG(T), -1);
+			if (i)
+				emit(c, 0x66, 3, 0x0e, R, REG(S), 0,	/* pblendw */
+				     q ? 0xf0 : 3 << (2 * i));
+		}
+		lane_out(c, R, l);
+	}
+	if (!in->L)
+		zero_hi(c, in->reg);
+}
+
+/* Which inline sequence, if any, replaces the helper for this instruction. */
+enum { IL_NONE, IL_PCMPGTQ, IL_VTEST, IL_VARSHIFT };
+
+static int inline_kind(const struct fa_insn *in, int no_sse41)
+{
+	if (in->kind != FA_K_VEX || in->map != 2 || in->pp != 1)
+		return IL_NONE;
+	switch (in->opcode) {
+	case 0x37:					/* vpcmpgtq: SSE2 only */
+		return IL_PCMPGTQ;
+	case 0x17:					/* vptest ymm */
+		return !no_sse41 && in->L ? IL_VTEST : IL_NONE;
+	case 0x0e: case 0x0f:				/* vtestps, vtestpd */
+		return !no_sse41 ? IL_VTEST : IL_NONE;
+	case 0x45: case 0x47:				/* vpsrlvd/q, vpsllvd/q */
+		return !no_sse41 ? IL_VARSHIFT : IL_NONE;
+	case 0x46:					/* vpsravd */
+		return !no_sse41 && !in->W ? IL_VARSHIFT : IL_NONE;
+	}
+	return IL_NONE;
+}
+
+int fa_scratch_needed(const struct fa_insn *in, int no_sse41)
+{
+	return inline_kind(in, no_sse41) ? 3 : 2;
+}
+
+/* Returns 1 if the instruction was translated inline instead of by the helper. */
+static int do_inline(struct ctx *c)
+{
+	const struct fa_insn *in = c->in;
+	int k = inline_kind(in, c->env->no_sse41);
+
+	if (!k)
+		return 0;
+	fix_riprel(c, 0);
+	if (k == IL_PCMPGTQ)
+		do_pcmpgtq(c);
+	else if (k == IL_VTEST)
+		do_vtest(c, in->opcode == 0x17 ? 0 : in->opcode == 0x0e ? 32 : 64);
+	else
+		do_varshift(c);
+	return 1;
+}
+
 int fa_translate(const struct fa_insn *in, const struct fa_env *env)
 {
 	struct ctx ctx, *c = &ctx;
@@ -1183,7 +1427,11 @@ int fa_translate(const struct fa_insn *in, const struct fa_env *env)
 		return c->err ? -1 : (int)c->len;
 	}
 	if (in->kind == FA_K_SSE4) {
-		if (!env->no_sse41 && fa_is_sse41(in->map, in->opcode)) {
+		if (in->map == 2 && (in->opcode == 0xf0 || in->opcode == 0xf1) && in->pp == 3) {
+			fix_riprel(c, 0x7 | (1 << (in->reg & 15)));
+			do_crc32(c);
+			finish(c);
+		} else if (!env->no_sse41 && fa_is_sse41(in->map, in->opcode)) {
 			do_native(c);
 			finish(c);
 		} else {
@@ -1244,6 +1492,10 @@ int fa_translate(const struct fa_insn *in, const struct fa_env *env)
 			c->map = 1;
 			c->opc = 0x6f;
 		}
+	}
+	if ((o->shape == FA_S_HELPER || (o->shape == FA_S_PTEST && in->L)) && do_inline(c)) {
+		finish(c);
+		return c->err ? -1 : (int)c->len;
 	}
 	if (o->shape == FA_S_HELPER ||
 	    (o->shape == FA_S_PTEST && in->L)) {

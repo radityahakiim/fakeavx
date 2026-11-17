@@ -76,7 +76,7 @@ MODULE_PARM_DESC(force, "load even if the CPU already supports AVX (for testing 
 
 static unsigned long stat_fast, stat_slow, stat_translated, stat_patched, stat_patched_short,
 	stat_patched_int, stat_regions, stat_regions_borrowing, stat_unsupported,
-	stat_short_refused;
+	stat_short_refused, stat_unpatched;
 module_param(stat_fast, ulong, 0444);
 module_param(stat_slow, ulong, 0444);
 module_param(stat_translated, ulong, 0444);
@@ -87,6 +87,7 @@ module_param(stat_regions, ulong, 0444);
 module_param(stat_regions_borrowing, ulong, 0444);
 module_param(stat_unsupported, ulong, 0444);
 module_param(stat_short_refused, ulong, 0444);
+module_param(stat_unpatched, ulong, 0444);
 
 /* One translated guest instruction. stub == 0: known to be unsupported. */
 struct fa_tr {
@@ -512,38 +513,71 @@ static bool fa_near(unsigned long a, unsigned long b)
 #define FA_HEAP_GAP		(1UL << 30)
 #define FA_HEAP_GAP_WINDOW	(16UL << 20)
 
+/* Why an instruction that should have been patched was not (it then traps every time). */
+enum {
+	FW_OK, FW_HEAP, FW_STACK, FW_RANGE, FW_BUSY, FW_LIMIT, FW_NOMEM,
+	FW_BORROWED, FW_BYTES, FW_REL, FW_POKE,
+};
+
+static const char *const fa_why[] = {
+	[FW_OK] = "?",
+	[FW_HEAP] = "its stub window is too close above the heap",
+	[FW_STACK] = "its stub window is too close to the stack",
+	[FW_RANGE] = "its stub window is outside the usable address range",
+	[FW_BUSY] = "its stub window is taken by another mapping",
+	[FW_LIMIT] = "the process has too many code cache regions",
+	[FW_NOMEM] = "out of memory",
+	[FW_BORROWED] = "a short patch just before it already uses its first bytes",
+	[FW_BYTES] = "the bytes after it do not match the jump (they changed)",
+	[FW_REL] = "its stub is out of jump range",
+	[FW_POKE] = "the code could not be written",
+};
+
 /* Keep clear of where the heap and the stack may still want to grow. */
-static bool fa_addr_ok(struct mm_struct *mm, unsigned long a, unsigned long size,
-		       unsigned long heap_gap)
+static int fa_addr_ok(struct mm_struct *mm, unsigned long a, unsigned long size,
+		      unsigned long heap_gap)
 {
 	if (a < (1UL << 20) || a + size > TASK_SIZE_MAX - PAGE_SIZE || a + size < a)
-		return false;
+		return FW_RANGE;
 	if (a + size > mm->start_brk && a < mm->brk + heap_gap)
-		return false;
+		return FW_HEAP;
 	if (a + size > mm->start_stack - (1UL << 30) && a < mm->start_stack + (1UL << 20))
-		return false;
-	return true;
+		return FW_STACK;
+	return FW_OK;
 }
 
-/* addr == 0: anywhere */
-static struct fa_region *fa_region_map(struct fa_mm *fm, unsigned long addr,
-				       unsigned long size, bool blob)
+/* addr == 0: anywhere. *why (optional) receives the reason for a failure. */
+static struct fa_region *fa_region_map_why(struct fa_mm *fm, unsigned long addr,
+					   unsigned long size, bool blob, int *why)
 {
 	unsigned long flags = MAP_PRIVATE | MAP_ANONYMOUS;
 	struct fa_region *r;
+	int w;
 
-	if (fm->nregions >= FA_MAX_REGIONS)
+	if (fm->nregions >= FA_MAX_REGIONS) {
+		if (why)
+			*why = FW_LIMIT;
 		return NULL;
+	}
 	if (addr) {
-		if (!fa_addr_ok(fm->mm, addr, size, blob ? FA_HEAP_GAP : FA_HEAP_GAP_WINDOW))
+		w = fa_addr_ok(fm->mm, addr, size, blob ? FA_HEAP_GAP : FA_HEAP_GAP_WINDOW);
+		if (w) {
+			if (why)
+				*why = w;
 			return NULL;
+		}
 		flags |= MAP_FIXED_NOREPLACE;
 	}
 	r = kzalloc(sizeof(*r), GFP_KERNEL);
-	if (!r)
+	if (!r) {
+		if (why)
+			*why = FW_NOMEM;
 		return NULL;
+	}
 	addr = vm_mmap(NULL, addr, size, PROT_READ | PROT_EXEC, flags, 0);
 	if (IS_ERR_VALUE(addr)) {
+		if (why)
+			*why = (long)addr == -EEXIST ? FW_BUSY : FW_NOMEM;
 		kfree(r);
 		return NULL;
 	}
@@ -556,10 +590,18 @@ static struct fa_region *fa_region_map(struct fa_mm *fm, unsigned long addr,
 	r->start = addr;
 	r->size = size;
 	r->has_blob = blob;
+	if (why)
+		*why = FW_OK;
 	r->used = blob ? ALIGN(sizeof(fa_blob), 64) : 0;
 	list_add(&r->list, &fm->regions);
 	fm->nregions++;
 	return r;
+}
+
+static struct fa_region *fa_region_map(struct fa_mm *fm, unsigned long addr,
+				       unsigned long size, bool blob)
+{
+	return fa_region_map_why(fm, addr, size, blob, NULL);
 }
 
 /* First free stub address in r that lies in [lo, hi), or 0. */
@@ -610,10 +652,10 @@ static struct fa_region *fa_region_get(struct fa_mm *fm, unsigned long ip)
  * instruction) window.
  */
 static struct fa_region *fa_window_get(struct fa_mm *fm, unsigned long lo,
-				       unsigned long hi, unsigned long *addr)
+				       unsigned long hi, unsigned long *addr, int *why)
 {
 	struct fa_region *r;
-	int k;
+	int k, w = FW_RANGE;
 
 	list_for_each_entry(r, &fm->regions, list) {
 		*addr = fa_alloc_in(r, lo, hi, FA_ENTRY_MAX);
@@ -622,20 +664,27 @@ static struct fa_region *fa_window_get(struct fa_mm *fm, unsigned long lo,
 	}
 	if (hi - lo > (1UL << 20)) {
 		for (k = 0; k < 15; k++) {
-			r = fa_region_map(fm, PAGE_ALIGN(lo) + ((unsigned long)k << 20),
-					  256UL << 10, false);
+			r = fa_region_map_why(fm, PAGE_ALIGN(lo) + ((unsigned long)k << 20),
+					      256UL << 10, false, &w);
 			if (r)
 				goto got;
+			if (w == FW_HEAP || w == FW_STACK || w == FW_RANGE || w == FW_LIMIT)
+				break;	/* the rest of the window is no better */
 		}
+		*why = w;
 		return NULL;
 	}
-	r = fa_region_map(fm, PAGE_ALIGN(lo), 64UL << 10, false);
+	r = fa_region_map_why(fm, PAGE_ALIGN(lo), 64UL << 10, false, &w);
 	if (!r)
-		r = fa_region_map(fm, PAGE_ALIGN(lo), 8UL << 10, false);
-	if (!r)
+		r = fa_region_map_why(fm, PAGE_ALIGN(lo), 8UL << 10, false, &w);
+	if (!r) {
+		*why = w;
 		return NULL;
+	}
 got:
 	*addr = fa_alloc_in(r, lo, hi, FA_ENTRY_MAX);
+	if (!*addr)
+		*why = FW_BUSY;
 	return *addr ? r : NULL;
 }
 
@@ -711,8 +760,8 @@ static bool fa_borrowed(struct fa_mm *fm, unsigned long ip)
  * those borrowed bytes may be patched afterwards, or that jump would silently
  * change its target: see fa_borrowed().
  */
-static void fa_patch_site(struct fa_mm *fm, struct fa_tr *tr, unsigned long ip,
-			  const u8 *bytes)
+static int fa_patch_site(struct fa_mm *fm, struct fa_tr *tr, unsigned long ip,
+			 const u8 *bytes)
 {
 	long rel = (long)(tr->stub - (ip + 5));
 	s32 rel32 = (s32)rel;
@@ -721,33 +770,132 @@ static void fa_patch_site(struct fa_mm *fm, struct fa_tr *tr, unsigned long ip,
 	u8 b;
 
 	if (rel != rel32)
-		return;
+		return FW_REL;
 	jmp[0] = 0xe9;
 	memcpy(jmp + 1, &rel32, 4);
 	if (memcmp(jmp + plen, bytes + plen, 5 - plen))
-		return;
+		return FW_BYTES;
 	if (fa_borrowed(fm, ip))
-		return;
+		return FW_BORROWED;
 
 	if (tr->bytes[0] != 0xc4 && tr->bytes[0] != 0xc5) {
 		b = 0xc4;
 		if (fa_poke(ip, &b, 1))
-			return;
+			return FW_POKE;
 		tr->bytes[0] = b;
 		on_each_cpu(fa_nop, NULL, 1);
 	}
 	if (fa_poke(ip + 1, jmp + 1, plen - 1))
-		return;
+		return FW_POKE;
 	memcpy(tr->bytes + 1, jmp + 1, plen - 1);
 	on_each_cpu(fa_nop, NULL, 1);
 	if (fa_poke(ip, jmp, 1))
-		return;
+		return FW_POKE;
 	tr->bytes[0] = jmp[0];
 	on_each_cpu(fa_nop, NULL, 1);
 	stat_patched++;
 	if (tr->len < 5)
 		stat_patched_short++;
+	return FW_OK;
 }
+
+/*
+ * An instruction meant to be patched was not: it will trap on every
+ * execution. Say which one and why, in dmesg (rate limited) and in
+ * /proc/fakeavx/unpatched (the last FA_UNP of them).
+ */
+#define FA_UNP	64
+
+struct fa_unp {
+	char comm[TASK_COMM_LEN];
+	pid_t pid;
+	char path[128];
+	unsigned long off, ip, lo, hi, heap_lo, heap_hi;
+	u8 bytes[15], len, why;
+};
+
+static struct fa_unp fa_unp[FA_UNP];
+static unsigned int fa_unp_next;
+static DEFINE_SPINLOCK(fa_unp_lock);
+
+static void fa_report_unpatched(struct fa_mm *fm, unsigned long ip, const u8 *bytes, int len,
+				int why, unsigned long lo, unsigned long hi)
+{
+	struct vm_area_struct *vma;
+	struct fa_unp u = { 0 };
+	char *buf = kmalloc(PATH_MAX, GFP_KERNEL), *p = NULL;
+
+	stat_unpatched++;
+	get_task_comm(u.comm, current);
+	u.pid = task_tgid_nr(current);
+	u.ip = ip;
+	u.len = min(len, 15);
+	memcpy(u.bytes, bytes, u.len);
+	u.why = why;
+	u.lo = lo;
+	u.hi = hi;
+	mmap_read_lock(fm->mm);
+	u.heap_lo = fm->mm->start_brk;
+	u.heap_hi = fm->mm->brk;
+	vma = vma_lookup(fm->mm, ip);
+	if (vma && vma->vm_file) {
+		u.off = ip - vma->vm_start + (vma->vm_pgoff << PAGE_SHIFT);
+		if (buf)
+			p = file_path(vma->vm_file, buf, PATH_MAX);
+	} else {
+		u.off = ip;
+	}
+	mmap_read_unlock(fm->mm);
+	strscpy(u.path, !IS_ERR_OR_NULL(p) ? p : "?", sizeof(u.path));
+	kfree(buf);
+
+	spin_lock(&fa_unp_lock);
+	fa_unp[fa_unp_next++ % FA_UNP] = u;
+	spin_unlock(&fa_unp_lock);
+
+	if (lo)
+		pr_info_ratelimited("%s[%d] %s+%#lx: %d-byte instruction %*ph not patched, traps every time: %s (window %#lx-%#lx, heap %#lx-%#lx)\n",
+				    u.comm, u.pid, u.path, u.off, u.len, u.len, u.bytes,
+				    fa_why[why], lo, hi, u.heap_lo, u.heap_hi);
+	else
+		pr_info_ratelimited("%s[%d] %s+%#lx: %d-byte instruction %*ph not patched, traps every time: %s\n",
+				    u.comm, u.pid, u.path, u.off, u.len, u.len, u.bytes,
+				    fa_why[why]);
+}
+
+static int fa_unp_show(struct seq_file *m, void *v)
+{
+	unsigned int i, n;
+
+	seq_puts(m, "# program[pid] file+offset bytes: reason [stub window] [heap]\n");
+	spin_lock(&fa_unp_lock);
+	n = min(fa_unp_next, (unsigned int)FA_UNP);
+	for (i = 0; i < n; i++) {
+		const struct fa_unp *u = &fa_unp[(fa_unp_next - n + i) % FA_UNP];
+
+		seq_printf(m, "%s[%d] %s+%#lx %*ph: %s", u->comm, u->pid, u->path, u->off,
+			   u->len, u->bytes, fa_why[u->why]);
+		if (u->lo)
+			seq_printf(m, " [window %#lx-%#lx] [heap %#lx-%#lx, window starts %+ld MB from heap end]",
+				   u->lo, u->hi, u->heap_lo, u->heap_hi,
+				   ((long)u->lo - (long)u->heap_hi) / (1L << 20));
+		seq_putc(m, '\n');
+	}
+	spin_unlock(&fa_unp_lock);
+	return 0;
+}
+
+static int fa_unp_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, fa_unp_show, NULL);
+}
+
+static const struct proc_ops fa_unp_proc_ops = {
+	.proc_open = fa_unp_open,
+	.proc_read = seq_read,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
 
 /* ------------------------------------------------------------------ */
 /* #UD handling                                                        */
@@ -805,7 +953,7 @@ static struct fa_tr *fa_make_entry(struct fa_mm *fm, struct fa_region *main,
 	struct fa_region *r = NULL;
 	u8 stub[FA_ENTRY_MAX], cur[5];
 	struct fa_tr *tr;
-	int n;
+	int n, why = FW_OK;
 
 	/* what follows may have been patched since the region was read */
 	if (want_patch && copy_from_user(cur, (void __user *)ip, 5))
@@ -819,9 +967,13 @@ static struct fa_tr *fa_make_entry(struct fa_mm *fm, struct fa_region *main,
 
 		memcpy(&fixed, cur + it->len, 5 - it->len);
 		lo = ip + 5 + (long)(s32)(fixed << shift);
-		r = fa_window_get(fm, lo, lo + (1UL << shift), &addr);
-		if (!r)
+		r = fa_window_get(fm, lo, lo + (1UL << shift), &addr, &why);
+		if (!r) {
 			stat_short_refused++;	/* will trap on every execution */
+			fa_report_unpatched(fm, ip, it->bytes, it->len, why, lo,
+					    lo + (1UL << shift));
+			want_patch = false;
+		}
 	}
 	if (!r && !map) {
 		addr = target;		/* nothing to set up: enter the body directly */
@@ -840,8 +992,11 @@ static struct fa_tr *fa_make_entry(struct fa_mm *fm, struct fa_region *main,
 	tr = fa_tr_store(fm, ip, addr, it->bytes, it->len);
 	if (!tr)
 		return NULL;
-	if (want_patch)
-		fa_patch_site(fm, tr, ip, cur);
+	if (want_patch) {
+		why = fa_patch_site(fm, tr, ip, cur);
+		if (why)
+			fa_report_unpatched(fm, ip, it->bytes, it->len, why, 0, 0);
+	}
 	return tr;
 }
 
@@ -1488,8 +1643,10 @@ static int __init fa_init(void)
 	if (!fa_wq)
 		return -ENOMEM;
 	fa_proc_dir = proc_mkdir("fakeavx", NULL);
-	if (fa_proc_dir)
+	if (fa_proc_dir) {
 		proc_create("sites", 0444, fa_proc_dir, &fa_sites_proc_ops);
+		proc_create("unpatched", 0444, fa_proc_dir, &fa_unp_proc_ops);
+	}
 	ret = register_kprobe(&fa_kp_new);
 	if (ret) {
 		pr_err("cannot hook wake_up_new_task: %d\n", ret);

@@ -23,6 +23,7 @@
 /tests/regtest
 /tests/guest/guest_test
 /tests/guest/cpuid_test
+/tests/guest/unpatched_test
 
 # editor / misc
 *.swp

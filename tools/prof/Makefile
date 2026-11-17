@@ -6,7 +6,7 @@ CC ?= gcc
 CFLAGS ?= -O2 -g -Wall
 ARCH := -march=core2 -mtune=generic -mno-avx
 CORE := ../../core/decode.c ../../core/translate.c ../../core/optable.c \
-	../../core/intdec.c ../../core/region.c ../../core/lendec.c
+	../../core/intdec.c ../../core/region.c ../../core/lendec.c ../../core/ssedec.c
 
 all: fakeavx-prof
 

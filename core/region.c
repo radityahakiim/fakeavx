@@ -162,7 +162,8 @@ static void discover(struct fa_rgn *r)
 					break;
 				it->kind = FA_R_OURS;
 				it->len = it->in.len;
-			} else if (!fa_decode_int(it->bytes, it->nread, ip, &ii)) {
+			} else if (!fa_decode_int(it->bytes, it->nread, ip, &ii) ||
+				   !fa_decode_sse(it->bytes, it->nread, ip, &ii, &it->xmm)) {
 				if (ii.kind == FA_I_PLAIN && ii.disp_off && !reachable(r, ii.target))
 					break;
 				it->kind = ii.kind == FA_I_PLAIN ? FA_R_PLAIN :
@@ -202,7 +203,7 @@ static void discover(struct fa_rgn *r)
 static void make_map(struct fa_rgn *r)
 {
 	struct fa_regmap *m = &r->map;
-	int cnt[16] = { 0 }, cycle = 0, nfree = 0, g;
+	int cnt[16] = { 0 }, cycle = 0, nfree = 0, need = 2, g;
 	u16 used = 0, avail;
 	u8 freer[16];
 	u32 i;
@@ -216,9 +217,14 @@ static void make_map(struct fa_rgn *r)
 	for (i = 0; i < r->n; i++) {
 		struct fa_ritem *it = &r->it[i], *t;
 
+		if (it->kind == FA_R_PLAIN)
+			used |= it->xmm;	/* legacy SSE copied as is */
 		if (it->kind == FA_R_OURS) {
 			int wide;
 			u16 u = xmm_used(&it->in, &wide, r->no_sse41);
+
+			if (fa_scratch_needed(&it->in, r->no_sse41) > need)
+				need = fa_scratch_needed(&it->in, r->no_sse41);
 
 			used |= u;
 			if (wide)
@@ -238,16 +244,17 @@ static void make_map(struct fa_rgn *r)
 	for (g = 15; g >= 0; g--)
 		if (avail & (1 << g))
 			freer[nfree++] = g;
-	if (!nfree)
-		return;
+	if (nfree < need)
+		return;		/* not even the scratch registers: do not borrow */
 
 	/*
-	 * Two scratch registers first: that is the most one instruction's
-	 * translation needs, so it never has to spill inside the loop (and
-	 * always finds a register even if the rest are all in use).
+	 * Scratch registers first, as many as the hungriest instruction's
+	 * translation needs (2, or 3 for the inline helper replacements), so it
+	 * never has to spill inside the loop and always finds a register even
+	 * if the rest are all in use.
 	 */
 	g = 0;	/* next free register */
-	while (g < nfree && m->nscratch < 2)
+	while (g < nfree && m->nscratch < need)
 		m->scratch[m->nscratch++] = freer[g++];
 	while (g < nfree) {
 		int best = -1, j;

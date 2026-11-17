@@ -227,10 +227,10 @@ static void pick_target(void)
 
 static const char *const stat_names[] = {
 	"slow", "fast", "translated", "patched", "patched_short", "patched_int",
-	"regions", "regions_borrowing", "unsupported", "short_refused",
+	"regions", "regions_borrowing", "unsupported", "short_refused", "unpatched",
 };
 #define NSTAT ((int)(sizeof(stat_names) / sizeof(stat_names[0])))
-enum { S_SLOW, S_FAST, S_TRANSLATED, S_PATCHED, S_PSHORT, S_PINT, S_REGIONS, S_RBORROW, S_UNSUP, S_SREFUSED };
+enum { S_SLOW, S_FAST, S_TRANSLATED, S_PATCHED, S_PSHORT, S_PINT, S_REGIONS, S_RBORROW, S_UNSUP, S_SREFUSED, S_UNPATCHED };
 
 static int stat_fd[NSTAT];
 static int module_loaded;
@@ -517,7 +517,7 @@ static const char *const shape_names[] = {
 };
 
 /*
- * Calls into the helper blob (generic C helper, or the POPCNT routine):
+ * Calls into the helper blob (generic C helper, or the POPCNT or CRC32 routine):
  * every "call rel32" whose target is one of the blob's entry points. p is
  * the code as it would sit at guest address addr.
  */
@@ -536,7 +536,8 @@ static int count_helpers(const u8 *p, int len, u64 addr, u64 blob)
 
 			memcpy(&rel, p + i + 1, 4);
 			to = addr + i + 5 + (s64)rel;
-			if (to == blob + FA_BLOB_HELPER || to == blob + FA_BLOB_POPCNT)
+			if (to == blob + FA_BLOB_HELPER || to == blob + FA_BLOB_POPCNT ||
+			    to == blob + FA_BLOB_CRC32)
 				n++;
 		}
 		i += l;

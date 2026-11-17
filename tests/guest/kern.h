@@ -13,6 +13,7 @@ struct data {
 #define KERNELS(P) \
 	void P##_float(struct data *d); void P##_double(struct data *d); \
 	void P##_int(struct data *d); void P##_bytes(struct data *d); \
-	void P##_popcnt(struct data *d); void P##_simd(struct data *d);
+	void P##_popcnt(struct data *d); void P##_simd(struct data *d); \
+	void P##_mixsse(struct data *d);
 KERNELS(ref)
 KERNELS(avx)

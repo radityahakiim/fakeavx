@@ -1,6 +1,7 @@
 /* Compiled twice: plain C with -mno-avx (PFX=ref) and AVX2 (PFX=avx, -DUSE_AVX). */
 #include "kern.h"
 #include <math.h>
+#include <string.h>
 #ifdef USE_AVX
 #include <immintrin.h>
 #endif
@@ -135,6 +136,102 @@ void FN(_simd)(struct data *d)
 			_mm256_shuffle_epi8(_mm256_loadu_si256((void *)&d->ba[i]),
 					    _mm256_loadu_si256((void *)&d->bb[i])));
 	_mm256_zeroupper();
+	d->sum = s;
+}
+#endif
+
+/*
+ * AVX and legacy SSE in one loop (tests/regtest.c): the region must carry the
+ * legacy instructions along and borrow only registers they do not use. The
+ * legacy ones use xmm12-15, which are the first a region would borrow if it
+ * did not account for them. The legacy paddd writes the low half of ymm3,
+ * whose upper half the AVX code computed: it must survive.
+ */
+#ifndef USE_AVX
+void FN(_mixsse)(struct data *d)
+{
+	uint64_t s = 0;
+
+	for (int i = 0; i < N - 8; i += 8) {	/* pshufb reads 16 bytes of bb at i */
+		int32_t y2[8], y3[8], x4[4], x6[4];
+		uint8_t sh[16];
+		int mask = 0;
+
+		for (int j = 0; j < 8; j++) {
+			y2[j] = (int32_t)((uint32_t)d->ia[i + j] + (uint32_t)d->ib[i + j]);
+			y3[j] = d->ia[i + j] ^ y2[j];
+		}
+		for (int k = 0; k < 4; k++) {
+			int16_t a0 = (int16_t)d->ia[i + k], a1 = (int16_t)(d->ia[i + k] >> 16);
+			int16_t b0 = (int16_t)d->ib[i + k], b1 = (int16_t)(d->ib[i + k] >> 16);
+
+			x4[k] = (int32_t)(uint32_t)((int64_t)a0 * b0 + (int64_t)a1 * b1);	/* pmaddwd */
+		}
+		for (int k = 0; k < 4; k++)
+			x6[k] = x4[3 - k];						/* pshufd 0x1b */
+		for (int k = 0; k < 4; k++) {
+			y3[k] = (int32_t)((uint32_t)y3[k] + (uint32_t)x4[k]);		/* paddd xmm4, xmm3 */
+			mask |= ((uint32_t)x4[k] >> 31) << k;				/* movmskps */
+			d->fo[i + k] = (float)d->ib[i + k];				/* cvtdq2ps */
+		}
+		for (int j = 0; j < 16; j++) {						/* pshufb */
+			uint8_t m = d->bb[i + j];
+
+			sh[j] = m & 0x80 ? 0 : ((uint8_t *)x6)[m & 15];
+		}
+		for (int j = 0; j < 8; j++)
+			d->io[i + j] = y3[j];
+		memcpy(&d->qo[i / 2], sh, 16);
+		s += (uint32_t)mask;
+	}
+	d->sum = s;
+}
+#else
+void FN(_mixsse)(struct data *d)
+{
+	uint64_t s = 0;
+	long n = N / 8 - 1;
+	const int32_t *ia = d->ia, *ib = d->ib;
+	const uint8_t *bb = d->bb;
+	int32_t *io = d->io;
+	float *fo = d->fo;
+	uint64_t *qo = d->qo;
+
+	__asm__ volatile(
+		"1:\n\t"
+		"prefetcht0 64(%[ia])\n\t"
+		"movdqu (%[ia]), %%xmm12\n\t"
+		"movdqu (%[ib]), %%xmm13\n\t"
+		"vmovdqu (%[ia]), %%ymm0\n\t"
+		"vmovdqu (%[ib]), %%ymm1\n\t"
+		"vpaddd %%ymm1, %%ymm0, %%ymm2\n\t"
+		/* legacy writes while the upper halves of ymm0 and ymm2 are live */
+		"pmaddwd %%xmm13, %%xmm12\n\t"
+		"pshufd $0x1b, %%xmm12, %%xmm14\n\t"
+		/* AVX while xmm12-14 hold live legacy values */
+		"vpxor %%ymm0, %%ymm2, %%ymm3\n\t"
+		"paddd %%xmm12, %%xmm3\n\t"
+		"movmskps %%xmm12, %%eax\n\t"
+		"add %%rax, %[s]\n\t"
+		"cvtdq2ps %%xmm13, %%xmm15\n\t"
+		"movups %%xmm15, (%[fo])\n\t"
+		"movdqu (%[bb]), %%xmm13\n\t"
+		"pshufb %%xmm13, %%xmm14\n\t"
+		"movdqu %%xmm14, (%[qo])\n\t"
+		"vmovdqu %%ymm3, (%[io])\n\t"
+		"add $32, %[ia]\n\t"
+		"add $32, %[ib]\n\t"
+		"add $32, %[io]\n\t"
+		"add $32, %[fo]\n\t"
+		"add $8, %[bb]\n\t"
+		"add $32, %[qo]\n\t"
+		"dec %[n]\n\t"
+		"jnz 1b\n\t"
+		"vzeroupper"
+		: [s] "+r"(s), [n] "+r"(n), [ia] "+r"(ia), [ib] "+r"(ib), [io] "+r"(io),
+		  [fo] "+r"(fo), [bb] "+r"(bb), [qo] "+r"(qo)
+		: : "rax", "xmm0", "xmm1", "xmm2", "xmm3", "xmm12", "xmm13", "xmm14", "xmm15",
+		    "memory", "cc");
 	d->sum = s;
 }
 #endif

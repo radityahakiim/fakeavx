@@ -454,6 +454,38 @@ accounted for exactly (plus xmm0 for the blendv forms), instead of going
 through the C helper and disabling register borrowing for the whole region.
 On SSSE3-only hosts, and for SSE4.2, the helper remains.
 
+**Legacy SSE inside regions.** Code like Bun's is mostly legacy SSE (96% of
+its vector instructions), and any such instruction used to end a region, so
+a loop mixing it with AVX never ran entirely in the code cache: every AVX
+instruction entered and left on its own. `core/ssedec.c` accepts legacy
+SSE/SSE2/SSE3/SSSE3/MMX instructions and prefetches that every Core 2 has,
+only in encodings that are valid as written (so nothing new can fault in the
+cache), and never with lock, %gs, addr32 or ambiguous prefixes. Regions copy
+them like integer instructions (`FA_R_PLAIN`, rip-relative operands fixed
+up) and never borrow the xmm registers they name; none of them uses an xmm
+register implicitly. `tests/ssedec_check.py` checks lengths, rip targets,
+the instruction class and Capstone's view of every register read or written.
+
+**Helper calls replaced.** A helper call saves and restores all general and
+xmm registers, the flags and MXCSR, and decodes the instruction again in C:
+200-620 cycles on the T61. `vpcmpgtq` (SSE2: the sign of
+`(b & ~a) | (~(a ^ b) & (b - a))`, exact under overflow), `vptest ymm`,
+`vtestps/pd` (both lanes and both flags folded into one register, then one
+`ptest`), and the variable shifts (each count zero-extended with `pmovzxdq`,
+the lane shifted, the element kept with `pblendw`; out-of-range counts give
+0 or the sign exactly as AVX2 does) are now inline SSE. They need three
+scratch registers; `fa_scratch_needed()` tells the region builder, which
+reserves them before borrowing anything else. `crc32` goes to a table-driven
+routine in the blob (flags preserved with pushfq/popfq) instead of the bitwise
+C code. Gathers, masked moves, cross-lane permutes and `pcmpXstrX` still use
+the C helper.
+
+**Unpatched instructions.** Every instruction meant to be patched that is
+not (no stub window, a short patch before it borrowing its bytes, bytes that
+changed, ...) is reported with its program, file and offset, bytes and
+reason, in dmesg and in `/proc/fakeavx/unpatched`, and counted in
+`stat_unpatched`.
+
 **Policy.** Every process is handled by default (`policy=1`); `FAKEAVX=0` in
 the environment opts a program out.
 

@@ -1,6 +1,7 @@
 CC ?= gcc
 CFLAGS := -O1 -g -Wall -Wno-unused-function
-CORE := ../core/decode.c ../core/translate.c ../core/optable.c ../core/intdec.c ../core/region.c
+CORE := ../core/decode.c ../core/translate.c ../core/optable.c ../core/intdec.c ../core/region.c \
+	../core/ssedec.c
 
 all: difftest
 ../helpers/blob.h: ../helpers/helper.c ../helpers/entry.S ../core/fakeavx.h

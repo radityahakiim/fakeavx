@@ -105,6 +105,7 @@ int main(int argc, char **argv)
 		case 0: case 1: case 2: code[0] = 0xc5; break;
 		case 3: case 4: case 5: code[0] = 0xc4; code[1] = (code[1] & 0xe0) | (1 + rnd() % 3); break;
 		case 6: code[0] = 0xf3; code[1] = 0x0f; code[2] = 0xb8; break;
+		case 7: if (rnd() & 1) { code[0] = 0x66; code[1] = 0x0f; } else { code[0] = 0x0f; } break;
 		default: break;
 		}
 		/* stub address: sometimes near the code, sometimes far away */
@@ -112,6 +113,15 @@ int main(int argc, char **argv)
 		env.blob_addr = env.out_addr - 0x10000;
 		env.no_jmp = rnd() & 1;
 		code = realloc(code, n);	/* exact-size buffer so ASan sees over-reads */
+		{
+			struct fa_int si;
+			u16 xm;
+
+			if (fa_decode_sse(code, n, 0x555555100000ULL, &si, &xm) == 0 && si.len > n) {
+				printf("sse decoder claims %d bytes of %d\n", si.len, n);
+				return 1;
+			}
+		}
 		if (fa_decode(code, n, 0x555555100000ULL, &in) == 0) {
 			ok++;
 			if (in.len > n) {

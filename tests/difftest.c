@@ -241,7 +241,8 @@ static const u64 dspecial[] = {
 
 static void fill_vec(u8 *p, int n)
 {
-	int kind = rnd() % 6, i;
+	/* 6-9: all zero, all ones, one half zero: ZF/CF = 1 for (v)ptest/vtest */
+	int kind = rnd() % 10, i;
 
 	for (i = 0; i < n; i += 8) {
 		u64 v;
@@ -266,9 +267,18 @@ static void fill_vec(u8 *p, int n)
 		case 4:
 			v = rnd() % 70;
 			break;
-		default:
+		case 5:
 			v = (rnd() % 40) | ((rnd() % 40) << 32);
 			if (rnd() & 1) v |= 0x8000000080000000ULL & rnd();
+			break;
+		case 6:
+			v = 0;
+			break;
+		case 7:
+			v = ~0ULL;
+			break;
+		default:	/* 8: low 16 bytes zero, 9: the rest zero */
+			v = (i < 16) == (kind == 8) ? 0 : rnd();
 			break;
 		}
 		memcpy(p + i, &v, n - i < 8 ? n - i : 8);
@@ -462,8 +472,8 @@ static int run_one(const char *name, const struct enc *e, const struct regs *ini
 			freer[i] = freer[j];
 			freer[j] = t;
 		}
-		/* like region.c: two scratch registers come first */
-		while (nf && map.nscratch < 2) {
+		/* like region.c: the scratch registers come first */
+		while (nf && map.nscratch < fa_scratch_needed(&in, env.no_sse41)) {
 			map.scratch[map.nscratch] = freer[--nf];
 			map.reserved |= 1 << map.scratch[map.nscratch++];
 		}
