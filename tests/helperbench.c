@@ -11,6 +11,8 @@
  *                                cmp the outputs (old blob = oracle)
  *   helperbench vexpair [N]      VEX vpcmpXstrX against their legacy encodings
  *   helperbench sdump "" [N]     pcmpXstrX, all control bytes: state dump for two builds
+ *   helperbench gdump "" [N]     gathers, every form and corner case: state dump for two builds
+ *   helperbench mgdump "" [N]    the same gathers, executed under the loaded module
  *   helperbench mvexpair [N]     the same, executed under the loaded module
  *   helperbench mdump|mrdump|mrtime   the same instructions and loops run
  *                                natively, so that the loaded fakeavx module
@@ -553,6 +555,96 @@ static void sdump(long cases)
 				}
 }
 
+/*
+ * gdump: complete state after VEX gathers, every form (vpgatherdd/dq/qd/qq,
+ * vgatherdps/dpd/qps/qpd x L x scale) x base register (rax, rcx, rsi, r9:
+ * the fast path's scratch registers among them) x register sets (high
+ * registers; one set with dest == mask, #UD on hardware, which must keep the
+ * helper's behaviour) x displacement, on masks all set / none / random /
+ * all but the last / lower half only, indices -8..7 (sign extension), random
+ * flags. Compare two builds (helper_oracle.sh).
+ */
+static void gdump(long cases, int module)
+{
+	static struct hb_state a;
+	static const int bases[] = { 0, 1, 6, 9 };
+	static const int sets[][3] = { { 0, 5, 6 }, { 9, 12, 14 }, { 15, 1, 8 }, { 3, 3, 6 } };	/* dest, mask, index */
+	u8 *stub = code + 0x10000, ins[16];
+	/* module mode: the instruction itself, then ret, in an anonymous executable page */
+	u8 *page = module ? mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+				 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) : NULL;
+
+	for (int opc = 0x90; opc <= 0x93; opc++)
+	 for (int w = 0; w < 2; w++)
+	  for (int l = 0; l < 2; l++)
+	   for (int sc = 0; sc < 4; sc++)
+	    for (int bi = 0; bi < 4; bi++)
+	     for (int si = 0; si < 4; si++)
+	      for (int di = 0; di < 2; di++) {
+		int base = bases[bi], D = sets[si][0], M = sets[si][1], I = sets[si][2];
+		s8 disp = di ? -24 : 0;
+		struct hb_ent e = { "g", ins, ins + 7 };
+		char name[64];
+
+		/* VEX3: c4 RXB.00010 W.vvvv.L.01 opc modrm(01 D 100) sib disp8 */
+		ins[0] = 0xc4;
+		ins[1] = 0x02 | (D < 8 ? 0x80 : 0) | (I < 8 ? 0x40 : 0) | (base < 8 ? 0x20 : 0);
+		ins[2] = (w << 7) | ((~M & 15) << 3) | (l << 2) | 1;
+		ins[3] = opc;
+		ins[4] = 0x44 | ((D & 7) << 3);
+		ins[5] = (sc << 6) | ((I & 7) << 3) | (base & 7);
+		ins[6] = (u8)disp;
+		if (module) {
+			memcpy(page, ins, 7);
+			page[7] = 0xc3;
+		} else {
+			build(&e, 1, stub);
+		}
+		for (long k = 0; k < cases; k++) {
+			int ds = w ? 8 : 4, is = (opc & 1) ? 8 : 4;
+
+			fill(&a, "gdump", k * 7919 + opc * 131 + w * 61 + l * 31 + sc * 17 + bi * 7 + si * 3 + di);
+			/* indices -8..7 in every element of the index register */
+			for (int j = 0; j < 32 / is; j++) {
+				s64 v = (s64)(rnd() % 16) - 8;
+				u8 *dst = j * is < 16 ? a.xmm[I] + j * is : a.hi[I] + j * is - 16;
+
+				memcpy(dst, &v, is);
+			}
+			/* mask patterns */
+			for (int j = 0; j < 32 / ds; j++) {
+				int on;
+				u8 *dst = j * ds < 16 ? a.xmm[M] + j * ds : a.hi[M] + j * ds - 16;
+				u64 v;
+
+				switch (k % 5) {
+				case 0: on = 1; break;
+				case 1: on = 0; break;
+				case 2: on = rnd() & 1; break;
+				case 3: on = j != (int)((l ? 32 : 16) / (ds > is ? ds : is)) - 1; break;
+				default: on = j * ds < 16; break;
+				}
+				v = (rnd() & ~(1ULL << (8 * ds - 1))) | ((u64)on << (8 * ds - 1));
+				if (D != M)
+					memcpy(dst, &v, ds);
+			}
+			a.gp[base] = (u64)a.mem + 256;		/* elements within mem[] */
+			if (module) {
+				hb_mrun(&a, page);
+			} else {
+				put_hi(&a);
+				hb_once(&a, stub);
+				get_hi(&a);
+			}
+			a.gp[base] -= (u64)a.mem;		/* address independent */
+			if (base == 6)
+				a.gp[6] += (u64)a.mem;		/* print_state subtracts it again */
+			snprintf(name, sizeof(name), "g%x/w%d/l%d/s%d/b%d/r%d/d%d", opc, w, l, sc, base, si, di);
+			print_state(name, k, &a);
+		}
+	      }
+}
+
 static void dump(const char *filter, long cases)
 {
 	static struct hb_state s;
@@ -811,6 +903,10 @@ int main(int argc, char **argv)
 	memcpy(st + FA_ST_MAGIC, &v, 8);
 	if (mode[0] == 'm') {		/* the module handles this process: no %gs of our own */
 		setvbuf(stdout, NULL, _IOFBF, 1 << 20);
+		if (!strcmp(mode, "mgdump")) {
+			gdump(argc > 3 ? atol(argv[3]) : 10, 1);
+			return 0;
+		}
 		if (!strcmp(mode, "mvexpair"))
 			return mvexpair(argc > 2 ? atol(argv[2]) : 50);
 		if (!strcmp(mode, "mdump"))
@@ -829,6 +925,10 @@ int main(int argc, char **argv)
 	CPU_SET(sched_getcpu(), &set);
 	sched_setaffinity(0, sizeof(set), &set);
 	setvbuf(stdout, NULL, getenv("HB_UNBUF") ? _IONBF : _IOFBF, 1 << 20);
+	if (!strcmp(mode, "gdump")) {
+		gdump(argc > 3 ? atol(argv[3]) : 10, 0);	/* gdump "" N, like the other modes */
+		return 0;
+	}
 	if (!strcmp(mode, "sdump")) {
 		sdump(argc > 3 ? atol(argv[3]) : 40);	/* sdump "" N, like the other modes */
 		return 0;

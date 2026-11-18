@@ -26,9 +26,10 @@ rc=0
 # dump: each instruction translated alone; rdump: the loops of hb_loops,
 # each built as a region (borrowed registers, exits) and run 1-50 times;
 # sdump: pcmpXstrX with every control byte, operand form and W (3072
-# combinations x 40 inputs)
-for what in dump rdump sdump; do
-	if [ $what = sdump ]; then k=40; else k=$n; fi
+# combinations x 40 inputs); gdump: gathers, every form and corner case
+# (2048 combinations x 10 inputs)
+for what in dump rdump sdump gdump; do
+	case $what in sdump) k=40 ;; gdump) k=10 ;; *) k=$n ;; esac
 	for mode in penryn ssse3; do
 		if [ $mode = ssse3 ]; then e="HB_NOSSE41=1"; else e="HB_PENRYN=1"; fi
 		tests=$(env $e "$top/tests/helperbench" $what "" 1 | wc -l)

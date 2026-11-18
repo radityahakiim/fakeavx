@@ -1106,6 +1106,174 @@ static void do_helper(struct ctx *c)
 		c->p[skip] = c->len - (skip + 1);
 }
 
+/*
+ * Gathers (P1.6): an inline fast path when every mask element is set, which
+ * is how compilers and hand-written code usually call them (the mask from
+ * vpcmpeqd x,x,x or a copy of it); otherwise the C helper as before.
+ *
+ *   save rcx, X (X: a scratch gpr that is not the guest's base register)
+ *   movmskps/pd mask -> ecx (+ upper lane via X), combined and compared with
+ *   lea only; jrcxz FAST; jmp SLOW          -- no instruction changes EFLAGS
+ * FAST:
+ *   per element: index -> X (pextrd/pextrq or a %gs load, dwords
+ *   sign-extended), pinsrd/pinsrq disp(base,X,scale) -> destination lane;
+ *   upper data half through a scratch register or the borrowed one; then
+ *   the mask is cleared (only now: a faulting load leaves it set, so the
+ *   instruction can simply be executed again)
+ * SLOW:
+ *   the helper call, after restoring what the check used.
+ *
+ * Not handled here (helper only): SSSE3-only hosts (no pextrd/pinsrd), the
+ * 2-element vpgatherqd/vgatherqps xmm form (half of the mask lane is
+ * ignored), and overlapping destination/index/mask registers (#UD on
+ * hardware; the helper's behaviour is kept).
+ */
+/* lea bytes, flag-neutral, all 32-bit (the 64-bit registers are zero-extended) */
+static void lea_rcx_plus_scaled(struct ctx *c, int x, int scale_log)
+{
+	if (x & 8)
+		put(c, 0x42);					/* REX.X */
+	put(c, 0x8d); put(c, 0x0c);				/* lea (%rcx,%rX,s), %ecx */
+	put(c, (scale_log << 6) | ((x & 7) << 3) | 1);
+}
+
+static void lea_x_times8(struct ctx *c, int x)
+{
+	if (x & 8)
+		put(c, 0x46);					/* REX.R REX.X */
+	put(c, 0x8d); put(c, ((x & 7) << 3) | 4);		/* lea 0(,%rX,8), %eX */
+	put(c, (3 << 6) | ((x & 7) << 3) | 5);
+	put32(c, 0);
+}
+
+static int do_gather(struct ctx *c)
+{
+	const struct fa_insn *in = c->in;
+	int qidx = in->opcode & 1, ds = in->W ? 8 : 4, is = qidx ? 8 : 4;
+	int D = in->reg, M = in->vvvv, I = in->mem.index;
+	int n = (in->L ? 32 : 16) / (ds > is ? ds : is);
+	int lanes = 16 / ds, ilanes = 16 / is, X = -1, T = -1, e, H, jmp_slow, jmp_end = -1;
+	u32 full = (1u << n) - 1;
+	struct fa_mem saved = c->mem;
+
+	if (c->env->no_sse41 || (qidx && ds == 4 && !in->L) ||
+	    D == I || D == M || I == M || !in->mem.has_index)
+		return 0;
+	/* the scratch gpr: not rcx (the check), not rsp, not the base */
+	for (e = 0; e < 16; e++)
+		if (e != 1 && e != 4 && !(in->mem.has_base && in->mem.base == e)) {
+			X = e;
+			break;
+		}
+	gpr_gs(c, 1, 1, 2);				/* rcx -> GTMP slot 2 */
+	gpr_gs(c, 1, X, 3);				/* X   -> GTMP slot 3 */
+	/*
+	 * A scratch xmm, if an upper half (mask or destination) is in memory:
+	 * taken before the branch, so that both paths see it saved, and the
+	 * slow path's restore below matches.
+	 */
+	if (n > lanes && (hireg(c, M) < 0 || hireg(c, D) < 0))
+		T = xscratch(c);
+
+	/* the check: ecx = mask bits of the n elements - all set; 0 iff all set */
+	emit(c, ds == 8 ? 0x66 : 0, 1, 0x50, 1, REG(M), 0, -1);	/* movmskps/pd M, %ecx */
+	if (n > lanes) {
+		int h = hireg(c, M);
+
+		if (h < 0) {
+			load_gs(c, T, GS(FA_ST_HI + 16 * M));
+			h = T;
+		}
+		emit(c, ds == 8 ? 0x66 : 0, 1, 0x50, X, REG(h), 0, -1);	/* upper lane -> X */
+		if (lanes == 4) {
+			lea_x_times8(c, X);
+			lea_rcx_plus_scaled(c, X, 1);	/* ecx += 16 * X */
+		} else {
+			lea_rcx_plus_scaled(c, X, 2);	/* ecx += 4 * X */
+		}
+	}
+	put(c, 0x8d); put(c, 0x89); put32(c, (u32)-(s32)full);	/* lea -full(%rcx), %ecx */
+	put(c, 0xe3); put(c, 5);			/* jrcxz FAST (over the jmp) */
+	put(c, 0xe9);
+	jmp_slow = c->len;
+	put32(c, 0);					/* jmp SLOW */
+
+	/* FAST */
+	gpr_gs(c, 0, 1, 2);				/* the guest's rcx again */
+	H = -1;
+	for (e = 0; e < n; e++) {
+		int ie = e % ilanes, de = e % lanes;
+		int from_hi = e >= ilanes, to_hi = e >= lanes;
+		int dst;
+
+		/* index element e -> X */
+		if (!from_hi) {
+			emit(c, 0x66, 3, 0x16, I, REG(X), is == 8, ie);	/* pextrd/q $ie, I, X */
+			if (is == 4)
+				emit(c, 0, 0, 0x63, X, REG(X), 1, -1);	/* movslq %eX, %rX */
+		} else if (hireg(c, I) >= 0) {
+			emit(c, 0x66, 3, 0x16, hireg(c, I), REG(X), is == 8, ie);
+			if (is == 4)
+				emit(c, 0, 0, 0x63, X, REG(X), 1, -1);
+		} else {
+			/* movslq / mov %gs:HI+16*I+is*ie, %rX */
+			emit(c, 0, 0, is == 4 ? 0x63 : 0x8b, X, GS(FA_ST_HI + 16 * I + is * ie), 1, -1);
+		}
+		/* destination lane */
+		if (!to_hi) {
+			dst = D;
+		} else {
+			if (H < 0)
+				H = hireg(c, D) >= 0 ? hireg(c, D) : T;	/* T: taken above */
+			dst = H;
+		}
+		c->mem.index = X;			/* the element's address: disp(base, X, scale) */
+		emit(c, 0x66, 3, 0x22, dst, MEM(0), ds == 8, de);	/* pinsrd/q $de, mem, dst */
+		c->mem = saved;
+	}
+	/* upper half of the destination: the elements built in H, or zero */
+	if (n > lanes) {
+		if (hireg(c, D) < 0)
+			store_gs(c, H, GS(FA_ST_HI + 16 * D));
+	} else {
+		zero_hi(c, D);
+	}
+	/* the mask is cleared, all of it */
+	pxor_self(c, M);
+	zero_hi(c, M);
+	gpr_gs(c, 0, X, 3);
+	{
+		int nx = c->nx, ok;
+
+		finish(c);				/* restore scratch xmm; jmp back (not in a region) */
+		if (c->env->no_jmp) {
+			put(c, 0xe9);			/* jmp END, inside a region */
+			jmp_end = c->len;
+			put32(c, 0);
+		}
+		/* SLOW */
+		ok = !c->err;
+		if (ok) {
+			u32 rel = c->len - (jmp_slow + 4);
+
+			memcpy(c->p + jmp_slow, &rel, 4);
+		}
+		gpr_gs(c, 0, 1, 2);
+		gpr_gs(c, 0, X, 3);
+		while (nx) {				/* finish() restored them on the fast path only */
+			nx--;
+			load_gs(c, c->xs[nx], GS(FA_ST_XTMP + 16 * nx));
+		}
+	}
+	do_helper(c);
+	if (jmp_end >= 0 && !c->err) {
+		u32 rel = c->len - (jmp_end + 4);
+
+		memcpy(c->p + jmp_end, &rel, 4);
+	}
+	return 1;
+}
+
 static void do_popcnt(struct ctx *c)
 {
 	const struct fa_insn *in = c->in;
@@ -1492,6 +1660,8 @@ int fa_translate(const struct fa_insn *in, const struct fa_env *env)
 		c->used |= env->map->reserved;
 	if (in->mod == 3)
 		c->used |= 1 << in->rm;
+	else if (in->map == 2 && in->opcode >= 0x90 && in->opcode <= 0x93)
+		c->used |= 1 << in->mem.index;		/* VSIB index register */
 	if (o->shape == FA_S_BLENDV)
 		c->used |= 1 << (in->imm >> 4);
 
@@ -1507,6 +1677,8 @@ int fa_translate(const struct fa_insn *in, const struct fa_env *env)
 			c->opc = 0x6f;
 		}
 	}
+	if (in->map == 2 && in->opcode >= 0x90 && in->opcode <= 0x93 && do_gather(c))
+		return c->err ? -1 : (int)c->len;
 	if ((o->shape == FA_S_HELPER || (o->shape == FA_S_PTEST && in->L)) && do_inline(c)) {
 		finish(c);
 		return c->err ? -1 : (int)c->len;

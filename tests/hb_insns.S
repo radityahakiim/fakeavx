@@ -153,6 +153,11 @@ hb_loops:
 	R crc32_only, "crc32q (%rsi), %rax", "crc32b %cl, %eax", "crc32l %r8d, %r9d"
 	R pcmpgtq_loop, "pcmpgtq %xmm2, %xmm1", "vpaddd %ymm1, %ymm3, %ymm3", "pcmpgtq %xmm9, %xmm8", "vpxor %ymm8, %ymm3, %ymm3"
 	R vex_helpers, "vpaddd %ymm1, %ymm0, %ymm0", "vpermd %ymm0, %ymm6, %ymm2", "vpmaskmovd (%rsi), %ymm3, %ymm4", "vpxor %ymm4, %ymm2, %ymm2", "vpcmpeqd %ymm5, %ymm5, %ymm5", "vpgatherdd %ymm5, (%rsi,%ymm6,4), %ymm7", "vpaddd %ymm7, %ymm2, %ymm1", "vpmaskmovd %ymm2, %ymm3, 64(%rsi)"
+	/* gathers in regions (fast path, slow path, upper halves in borrowed registers) */
+	R gather_dd_borrow, "vpcmpeqd %ymm5, %ymm5, %ymm5", "vpgatherdd %ymm5, (%rsi,%ymm6,4), %ymm7", "vpaddd %ymm7, %ymm1, %ymm1", "vpxor %ymm1, %ymm2, %ymm2"
+	R gather_qq_dps, "vpcmpeqd %ymm5, %ymm5, %ymm5", "vpgatherqq %ymm5, 8(%rsi,%ymm6,8), %ymm2", "vpaddq %ymm2, %ymm1, %ymm1", "vpcmpeqd %ymm4, %ymm4, %ymm4", "vgatherdps %ymm4, 4(%rsi,%ymm6,4), %ymm3", "vpxor %ymm3, %ymm0, %ymm0"
+	R gather_partial, "vpcmpgtd %ymm8, %ymm9, %ymm10", "vpgatherdd %ymm10, (%rsi,%ymm6,4), %ymm11", "vpaddd %ymm11, %ymm12, %ymm12", "vpxor %ymm12, %ymm13, %ymm13"
+	R gather_qd_dq, "vpcmpeqd %ymm5, %ymm5, %ymm5", "vpgatherqd %xmm5, (%rsi,%ymm6,4), %xmm7", "vpcmpeqd %ymm4, %ymm4, %ymm4", "vpgatherdq %ymm4, (%rsi,%xmm6,8), %ymm3", "vpaddq %ymm3, %ymm1, %ymm1", "vpaddd %xmm7, %xmm2, %xmm2"
 	R avx_only, "vpaddd %ymm1, %ymm0, %ymm0", "vpxor %ymm0, %ymm2, %ymm2", "vpshufb %ymm3, %ymm2, %ymm4", "vpaddq %ymm4, %ymm1, %ymm1"
 	.section .data.rel.ro.hbloops, "aw"
 	.globl hb_loops_end

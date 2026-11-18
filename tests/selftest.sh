@@ -120,7 +120,7 @@ run oracle tests/helper_oracle.sh "$ref" "$N_ORACLE"
 ident=$(grep -c "identical to" "$log")
 diffs=$(grep -c "DIFFERENT" "$log")
 if [ $rc = 0 ] && [ "$ident" -gt 0 ]; then
-	record "oracle vs $ref" PASS "$ident/6 comparisons identical$same_as_ref" $secs
+	record "oracle vs $ref" PASS "$ident/$((ident + diffs)) comparisons identical$same_as_ref" $secs
 else
 	record "oracle vs $ref" FAIL "$diffs comparison(s) DIFFERENT, see oracle.log" $secs
 fi
@@ -191,9 +191,13 @@ if [ $do_module = 1 ]; then
 	cmp <("$HB" rdump "" "$N_DUMP") <("$HB" mrdump "" "$N_DUMP") >>"$logs/mdump.log" 2>&1
 	rc2=$?
 	secs=$(( $(date +%s) - t0 ))
+	cmp <("$HB" gdump "" 10) <("$HB" mgdump "" 10) >>"$logs/mdump.log" 2>&1
+	rc3=$?
+	[ $rc3 = 0 ] || rc1=1
+	secs=$(( $(date +%s) - t0 ))
 	nins=$("$HB" dump "" 1 | wc -l); nloop=$("$HB" rdump "" 1 | wc -l)
 	if [ $rc1 = 0 ] && [ $rc2 = 0 ]; then
-		record "module vs userspace translator" PASS "$nins instructions + $nloop loops x $N_DUMP inputs identical" $secs
+		record "module vs userspace translator" PASS "$nins instructions + $nloop loops x $N_DUMP inputs, 2048 gather encodings x 10, identical" $secs
 	else
 		record "module vs userspace translator" FAIL "differs: see mdump.log" $secs
 	fi
