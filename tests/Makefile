@@ -8,6 +8,12 @@ all: difftest
 	$(MAKE) -C ../helpers
 difftest: difftest.c run.S $(CORE) ../core/fakeavx.h ../helpers/blob.h
 	$(CC) $(CFLAGS) -o $@ difftest.c run.S $(CORE)
+# helper paths in an ordinary process (no module): helperbench time | dump
+helperbench: helperbench.c hb_run.S hb_insns.S $(CORE) ../core/fakeavx.h ../helpers/blob.h
+	$(CC) -O2 -g -Wall -Wno-unused-function -march=core2 -o $@ helperbench.c hb_run.S hb_insns.S $(CORE)
+# same results as another build (default HEAD)? make helper-oracle [REF=...]
+helper-oracle: helperbench
+	./helper_oracle.sh $(or $(REF),HEAD)
 fuzz: fuzz.c $(CORE) ../core/fakeavx.h
 	$(CC) -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -o $@ fuzz.c $(CORE)
 regtest: regtest.c regsync.S $(CORE) ../core/fakeavx.h ../helpers/blob.h
@@ -27,4 +33,4 @@ divert-check: divert_check
 	objdump -d --insn-width=16 -j .text $(BIN) | awk -f divert_truth.awk > divert_truth.txt
 	./divert_check $(BIN) divert_truth.txt
 clean:
-	rm -f difftest fuzz regtest divert_check divert_truth.txt
+	rm -f difftest fuzz regtest divert_check divert_truth.txt helperbench

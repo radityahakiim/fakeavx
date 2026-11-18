@@ -15,14 +15,21 @@ _start:
 	.balign	8
 	jmp	crc32_entry		/* FA_BLOB_CRC32 */
 	.balign	8
+	jmp	helper_lean_entry	/* FA_BLOB_HELPER_LEAN */
+	.balign	8
 
 /*
  * In:  rdi = descriptor (struct fa_insn), [rsp] = return, [rsp+8] = guest rdi,
  *      guest rsp = rsp + 16 + 128.
  * All guest registers and flags are preserved except as modified by the C
  * helper through the frame.
+ *
+ * helper_entry saves all xmm registers to FA_ST_LO for the C code to read and
+ * write (the C code may use any of them). helper_lean_entry saves none: its C
+ * code is compiled with -mgeneral-regs-only, and the translator has stored
+ * the operand registers to FA_ST_LO itself and loads them back afterwards.
  */
-helper_entry:
+	.macro	HELPER_ENTRY cfunc, xmm
 	pushfq
 	sub	$128, %rsp
 	mov	%rax, 0(%rsp)
@@ -43,25 +50,43 @@ helper_entry:
 	mov	%r13, 104(%rsp)
 	mov	%r14, 112(%rsp)
 	mov	%r15, 120(%rsp)
+	.if \xmm
 	.irp n, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 	movaps	%xmm\n, %gs:FA_ST_LO + 16 * \n
 	.endr
+	.endif
 	mov	%rsp, %rsi
 	lea	128(%rsp), %rdx
 	mov	%gs:FA_ST_SELF, %rcx
 	mov	%rsp, %rbp
 	and	$-16, %rsp
-	sub	$16, %rsp
-	stmxcsr	(%rsp)		/* C code must not leave marks in MXCSR */
 	cld
-	call	fa_helper_c
-	ldmxcsr	(%rsp)
+	call	\cfunc		/* saves MXCSR itself where it computes in floating point */
 	mov	%rbp, %rsp
+	.if \xmm
 	.irp n, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 	movaps	%gs:FA_ST_LO + 16 * \n, %xmm\n
 	.endr
+	.endif
 	mov	56(%rsp), %rax
 	mov	%rax, 128+16(%rsp)
+	/*
+	 * Flags, without popfq (~20 cycles on Core 2). Only the arithmetic
+	 * flags (the C code, and results it wrote into the saved image) and DF
+	 * (cld above) can differ from the saved image; TF, AC and the rest are
+	 * as they were. OF first (the add sets all flags), then the low byte
+	 * with sahf, which leaves OF alone; nothing after this touches flags.
+	 */
+	mov	128(%rsp), %rax
+	test	$0x400, %eax
+	jz	1f
+	std
+1:	mov	%eax, %ecx
+	shr	$11, %ecx
+	and	$1, %ecx		/* OF of the image */
+	add	$0x7f, %cl		/* sets OF exactly when cl was 1 */
+	mov	%al, %ah
+	sahf				/* SF ZF AF PF CF of the image */
 	mov	0(%rsp), %rax
 	mov	8(%rsp), %rcx
 	mov	16(%rsp), %rdx
@@ -76,9 +101,14 @@ helper_entry:
 	mov	104(%rsp), %r13
 	mov	112(%rsp), %r14
 	mov	120(%rsp), %r15
-	add	$128, %rsp
-	popfq
+	lea	128+8(%rsp), %rsp	/* drop the frame and the flags image; lea keeps flags */
 	ret
+	.endm
+
+helper_entry:
+	HELPER_ENTRY fa_helper_c, 1
+helper_lean_entry:
+	HELPER_ENTRY fa_helper_lean_c, 0
 
 /*
  * In: rax = value (zero-extended). Out: rax = population count, EFLAGS exactly

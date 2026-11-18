@@ -43,6 +43,7 @@ typedef int64_t s64;
 #define FA_BLOB_HELPER	0x00
 #define FA_BLOB_POPCNT	0x08
 #define FA_BLOB_CRC32	0x10
+#define FA_BLOB_HELPER_LEAN 0x18	/* integer helpers: no xmm register saved */
 
 #define FA_MAX_STUB	512	/* upper bound for one translated instruction */
 
@@ -278,6 +279,40 @@ const struct fa_op *fa_lookup(u8 map, u8 pp, u8 opcode);
 
 /* Is (map 2 = 0F38 / 3 = 0F3A, opcode) an SSE4.1 operation (66 prefix)? */
 int fa_is_sse41(u8 map, u8 opcode);
+
+/*
+ * Does this helper operation compute without floating point? Then it is
+ * called through FA_BLOB_HELPER_LEAN: the blob saves no xmm register and its
+ * C code (helpers/helper_int.c) uses none; the translator stores just the
+ * registers fa_helper_xmm() names before the call and reloads them after.
+ * The rest (compares, SSE4.1 emulation on SSSE3-only hosts) goes through
+ * FA_BLOB_HELPER, which saves them all.
+ */
+static inline int fa_helper_lean(const struct fa_insn *in)
+{
+	if (in->kind == FA_K_SSE4)
+		return !fa_is_sse41(in->map, in->opcode);	/* pcmpXstrX, pcmpgtq, crc32 */
+	if (in->map == 1 && in->opcode == 0xc2)
+		return 0;					/* vcmp* */
+	return in->map == 2 && !fa_is_sse41(in->map, in->opcode);
+}
+
+/* xmm registers a lean helper operation may read or write */
+static inline u16 fa_helper_xmm(const struct fa_insn *in)
+{
+	u16 m = 1 << in->reg;
+
+	if (in->kind == FA_K_VEX)
+		m |= 1 << in->vvvv;
+	if (in->mod == 3)
+		m |= 1 << in->rm;
+	else if (in->kind == FA_K_VEX && in->mem.has_index &&
+		 in->map == 2 && in->opcode >= 0x90 && in->opcode <= 0x93)
+		m |= 1 << in->mem.index;			/* VSIB */
+	if (in->kind == FA_K_SSE4 && in->map == 3 && !(in->opcode & 1))
+		m |= 1;						/* pcmpXstrm writes xmm0 */
+	return m;
+}
 
 #endif /* !__ASSEMBLY__ */
 

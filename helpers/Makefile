@@ -11,10 +11,13 @@ entry.o: entry.S ../core/fakeavx.h
 	$(CC) $(BLOB_CFLAGS) -D__ASSEMBLY__ -c -o $@ $<
 sse41.o: ../core/optable.c ../core/fakeavx.h
 	$(CC) $(BLOB_CFLAGS) -c -o $@ ../core/optable.c
-helper.o: helper.c ../core/fakeavx.h
+helper.o: helper.c helper.h ../core/fakeavx.h
 	$(CC) $(BLOB_CFLAGS) -c -o $@ $<
-blob.elf: entry.o helper.o sse41.o blob.lds
-	ld -static -nostdlib --gc-sections -T blob.lds -o $@ entry.o helper.o sse41.o
+# entered without saving xmm registers: must not use any
+helper_int.o: helper_int.c helper.h ../core/fakeavx.h
+	$(CC) $(BLOB_CFLAGS) -mgeneral-regs-only -c -o $@ $<
+blob.elf: entry.o helper.o helper_int.o sse41.o blob.lds
+	ld -static -nostdlib --gc-sections -T blob.lds -o $@ entry.o helper.o helper_int.o sse41.o
 	@if readelf -S $@ | grep -E '\.(data|bss|got)' ; then echo "blob has writable data"; rm -f $@; exit 1; fi
 blob.bin: blob.elf
 	objcopy -O binary -j .text $< $@

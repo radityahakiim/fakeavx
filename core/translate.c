@@ -1047,6 +1047,14 @@ static void do_helper(struct ctx *c)
 	const u8 *d = (const u8 *)c->in;
 	u8 ops[4] = { c->in->reg, c->in->vvvv, c->in->reg, c->in->reg };
 	u16 sync = 0;
+	/*
+	 * Integer operations use the lean entry, which saves no xmm register:
+	 * store just the operand registers for the C code, and load them back
+	 * (with any result) afterwards. In a region these low halves are in the
+	 * host registers of the same number: no operand register is borrowed.
+	 */
+	int lean = fa_helper_lean(c->in);
+	u16 xm = lean ? fa_helper_xmm(c->in) : 0;
 
 	/* the helper works on the in-memory state: write cached upper halves back */
 	if (c->in->mod == 3)
@@ -1059,6 +1067,9 @@ static void do_helper(struct ctx *c)
 	for (i = 0; i < 16; i++)
 		if (sync & (1 << i))
 			store_gs(c, hireg(c, i), GS(FA_ST_HI + 16 * i));
+	for (i = 0; i < 16; i++)
+		if (xm & (1 << i))
+			store_gs(c, i, GS(FA_ST_LO + 16 * i));
 
 	/* lea rsp,[rsp-128]; push rdi; lea rdi,[rip+desc] */
 	put(c, 0x48); put(c, 0x8d); put(c, 0x64); put(c, 0x24); put(c, 0x80);
@@ -1066,10 +1077,13 @@ static void do_helper(struct ctx *c)
 	put(c, 0x48); put(c, 0x8d); put(c, 0x3d);
 	fix = c->len;
 	put32(c, 0);
-	emit_call_blob(c, FA_BLOB_HELPER);
+	emit_call_blob(c, lean ? FA_BLOB_HELPER_LEAN : FA_BLOB_HELPER);
 	put(c, 0x5f);
 	/* lea rsp,[rsp+128] */
 	put(c, 0x48); put(c, 0x8d); put(c, 0xa4); put(c, 0x24); put32(c, 128);
+	for (i = 0; i < 16; i++)
+		if (xm & (1 << i))
+			load_gs(c, i, GS(FA_ST_LO + 16 * i));
 	for (i = 0; i < 16; i++)
 		if (sync & (1 << i))
 			load_gs(c, hireg(c, i), GS(FA_ST_HI + 16 * i));

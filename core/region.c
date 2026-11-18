@@ -97,8 +97,18 @@ static u16 xmm_used(const struct fa_insn *in, int *wide, int no_sse41)
 
 	*wide = 0;
 	if (in->kind == FA_K_SSE4) {
-		if (no_sse41 || !fa_is_sse41(in->map, in->opcode))
-			return 0xffff;	/* goes through the helper; keep it simple */
+		/* crc32: general registers only (do_crc32 and the blob's entry) */
+		if (in->map == 2 && (in->opcode == 0xf0 || in->opcode == 0xf1) && in->pp == 3)
+			return 0;
+		/*
+		 * pcmpgtq, pcmpXstrX: the lean helper, which saves no xmm
+		 * register and touches exactly these (stored and reloaded by
+		 * the stub), so the others may be borrowed.
+		 */
+		if (fa_helper_lean(in))
+			return fa_helper_xmm(in);
+		if (no_sse41)
+			return 0xffff;	/* SSE4.1 emulated by the full helper; keep it simple */
 		/* runs natively (see do_native); rm may be a gpr: harmless */
 		m = 1 << in->reg;
 		if (in->mod == 3)

@@ -537,7 +537,7 @@ static int count_helpers(const u8 *p, int len, u64 addr, u64 blob)
 			memcpy(&rel, p + i + 1, 4);
 			to = addr + i + 5 + (s64)rel;
 			if (to == blob + FA_BLOB_HELPER || to == blob + FA_BLOB_POPCNT ||
-			    to == blob + FA_BLOB_CRC32)
+			    to == blob + FA_BLOB_CRC32 || to == blob + FA_BLOB_HELPER_LEAN)
 				n++;
 		}
 		i += l;
