@@ -8,6 +8,8 @@
 #   make guest          build the test programs for the AVX-less machine
 #   make prof           build tools/prof/fakeavx-prof, the per-instruction profiler
 #   make check          core tests; needs a machine with real AVX2
+#   make selftest       build and run every test this machine can run, write a
+#                       report to reports/ (tests/selftest.sh; QUICK=1 for ~5 min)
 #   make vmtest         end-to-end test in QEMU; needs KERNEL=bzImage built
 #                       from the tree the module was built against (KDIR)
 #   make clean
@@ -47,6 +49,9 @@ prof:
 check: helpers
 	$(MAKE) -C tests check
 
+selftest:
+	tests/selftest.sh $(if $(QUICK),--quick)
+
 vmtest: module guest
 	tests/qemu/run.sh
 
@@ -58,4 +63,4 @@ clean:
 	$(MAKE) -C tools/prof clean
 
 help:
-	@sed -n '3,14p' Makefile | sed 's/^# \{0,1\}//'
+	@sed -n '3,15p' Makefile | sed 's/^# \{0,1\}//'
