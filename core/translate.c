@@ -16,7 +16,7 @@
  */
 #include "fakeavx.h"
 
-enum { O_REG, O_MEM, O_GS };
+enum { O_REG, O_MEM, O_GS, O_BLOB };	/* O_BLOB: a constant in the helper blob, off = its offset */
 
 struct opnd {
 	u8 type;
@@ -45,6 +45,7 @@ struct ctx {
 #define REG(r)	((struct opnd){ O_REG, (r), 0 })
 #define MEM(a)	((struct opnd){ O_MEM, 0, (a) })
 #define GS(o)	((struct opnd){ O_GS, 0, (o) })
+#define BLOB(o)	((struct opnd){ O_BLOB, 0, (o) })
 #define HI(r)	hi_opnd(c, (r))
 
 static const u8 pp_prefix[4] = { 0, 0x66, 0xf3, 0xf2 };
@@ -106,6 +107,17 @@ static void emit_modrm(struct ctx *c, int reg, const struct opnd *o, int imm_len
 		put(c, (reg << 3) | 4);
 		put(c, 0x25);
 		put32(c, o->off);
+		return;
+	}
+	if (o->type == O_BLOB) {	/* rip-relative: the blob is within rel32 reach, as for calls */
+		s64 rel;
+
+		put(c, (reg << 3) | 5);
+		/* relative to the end of the instruction: after the modrm byte, disp32, imm */
+		rel = (s64)(c->env->blob_addr + o->off - (cur_addr(c) + 4 + imm_len));
+		if (rel != (s32)rel)
+			c->err = 1;
+		put32(c, (u32)rel);
 		return;
 	}
 	if (m->riprel) {
@@ -1544,7 +1556,57 @@ static void do_varshift(struct ctx *c)
 }
 
 /* Which inline sequence, if any, replaces the helper for this instruction. */
-enum { IL_NONE, IL_PCMPGTQ, IL_VTEST, IL_VARSHIFT };
+enum { IL_NONE, IL_PCMPGTQ, IL_VTEST, IL_VARSHIFT, IL_PERMD };
+
+/*
+ * vpermd / vpermps ymm (P1.5): dst[i] = src[idx[i] & 7], inline instead of
+ * the helper (~100 cycles -> ~15). Per result half, from that half's indices:
+ *   control  = pshufb(idx << 2, bcast) + offs, & 0x0f   byte (idx&3)*4 + 0..3
+ *   a, b     = pshufb(src.lo, control), pshufb(src.hi, control)
+ *   result   = idx bit 2 ? b : a     (mask = idx << 29 >> 31; and/andn/or,
+ *              not pblendvb, which would need xmm0)
+ * SSSE3 and SSE2 instructions only. The destination may be the source or the
+ * index register, so the low result waits in a state block slot until the
+ * high one is computed too. idx = vvvv, src = rm (register or memory).
+ */
+static void do_permd(struct ctx *c)
+{
+	const struct fa_insn *in = c->in;
+	int D = in->reg, I = in->vvvv, S = in->rm, mem = is_mem(c), h;
+	int T1 = xscratch(c), T2 = xscratch(c), T3 = xscratch(c);
+
+	for (h = 0; h < 2; h++) {
+		struct opnd ix = h ? HI(I) : REG(I);
+
+		/* T1 = control bytes */
+		load_gs(c, T1, ix);					/* movaps (reg or %gs slot) */
+		emit(c, 0x66, 1, 0x72, 6, REG(T1), 0, 2);		/* pslld $2 */
+		emit(c, 0x66, 2, 0x00, T1, BLOB(FA_BLOB_PERMD_BCAST), 0, -1);	/* pshufb */
+		emit(c, 0x66, 1, 0xfc, T1, BLOB(FA_BLOB_PERMD_OFFS), 0, -1);	/* paddb */
+		emit(c, 0x66, 1, 0xdb, T1, BLOB(FA_BLOB_NIBBLE), 0, -1);	/* pand */
+		/* T2, T3 = both source halves shuffled */
+		if (mem) {
+			loadu(c, T2, 0);
+			loadu(c, T3, 16);
+		} else {
+			mov_rr(c, T2, S);
+			load_gs(c, T3, HI(S));
+		}
+		emit(c, 0x66, 2, 0x00, T2, REG(T1), 0, -1);		/* pshufb T1, T2 */
+		emit(c, 0x66, 2, 0x00, T3, REG(T1), 0, -1);		/* pshufb T1, T3 */
+		/* T1 = all ones where index bit 2 is set; result = T1 ? T3 : T2 */
+		load_gs(c, T1, ix);
+		emit(c, 0x66, 1, 0x72, 6, REG(T1), 0, 29);		/* pslld $29 */
+		emit(c, 0x66, 1, 0x72, 4, REG(T1), 0, 31);		/* psrad $31 */
+		emit(c, 0x66, 1, 0xdb, T3, REG(T1), 0, -1);		/* pand T1, T3 */
+		emit(c, 0x66, 1, 0xdf, T1, REG(T2), 0, -1);		/* pandn T2, T1 */
+		emit(c, 0x66, 1, 0xeb, T1, REG(T3), 0, -1);		/* por T3, T1 */
+		if (!h)
+			store_gs(c, T1, GS(FA_ST_XTMP + 16 * 5));	/* low result, until both are done */
+	}
+	store_gs(c, T1, HI(D));
+	load_gs(c, D, GS(FA_ST_XTMP + 16 * 5));
+}
 
 static int inline_kind(const struct fa_insn *in, int no_sse41)
 {
@@ -1561,6 +1623,8 @@ static int inline_kind(const struct fa_insn *in, int no_sse41)
 		return !no_sse41 ? IL_VARSHIFT : IL_NONE;
 	case 0x46:					/* vpsravd */
 		return !no_sse41 && !in->W ? IL_VARSHIFT : IL_NONE;
+	case 0x16: case 0x36:				/* vpermps, vpermd: SSSE3 only */
+		return IL_PERMD;
 	}
 	return IL_NONE;
 }
@@ -1583,6 +1647,8 @@ static int do_inline(struct ctx *c)
 		do_pcmpgtq(c);
 	else if (k == IL_VTEST)
 		do_vtest(c, in->opcode == 0x17 ? 0 : in->opcode == 0x0e ? 32 : 64);
+	else if (k == IL_PERMD)
+		do_permd(c);
 	else
 		do_varshift(c);
 	return 1;

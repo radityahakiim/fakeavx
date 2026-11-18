@@ -27,8 +27,9 @@ rc=0
 # each built as a region (borrowed registers, exits) and run 1-50 times;
 # sdump: pcmpXstrX with every control byte, operand form and W (3072
 # combinations x 40 inputs); gdump: gathers, every form and corner case
-# (2048 combinations x 10 inputs)
-for what in dump rdump sdump gdump; do
+# (2048 combinations x 10 inputs); pdump: vpermd/vpermps, every aliasing
+# and operand form (48 combinations x N inputs)
+for what in dump rdump sdump gdump pdump; do
 	case $what in sdump) k=40 ;; gdump) k=10 ;; *) k=$n ;; esac
 	for mode in penryn ssse3; do
 		if [ $mode = ssse3 ]; then e="HB_NOSSE41=1"; else e="HB_PENRYN=1"; fi

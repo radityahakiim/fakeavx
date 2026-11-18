@@ -19,6 +19,19 @@ _start:
 	.balign	8
 
 /*
+ * Constants for inline translations, at fixed offsets (fakeavx.h), read
+ * RIP-relative from the stubs. vpermd/vpermps: the low byte of each dword
+ * broadcast to its 4 bytes, the byte offsets within a dword, and 0x0f.
+ */
+	.balign	16
+permd_bcast:				/* FA_BLOB_PERMD_BCAST */
+	.byte	0, 0, 0, 0, 4, 4, 4, 4, 8, 8, 8, 8, 12, 12, 12, 12
+permd_offs:				/* FA_BLOB_PERMD_OFFS */
+	.byte	0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3
+nibble_mask:				/* FA_BLOB_NIBBLE */
+	.fill	16, 1, 0x0f
+
+/*
  * In:  rdi = descriptor (struct fa_insn), [rsp] = return, [rsp+8] = guest rdi,
  *      guest rsp = rsp + 16 + 128.
  * All guest registers and flags are preserved except as modified by the C

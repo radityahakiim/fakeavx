@@ -44,6 +44,10 @@ typedef int64_t s64;
 #define FA_BLOB_POPCNT	0x08
 #define FA_BLOB_CRC32	0x10
 #define FA_BLOB_HELPER_LEAN 0x18	/* integer helpers: no xmm register saved */
+/* constants for inline translations (16 bytes each, 16-byte aligned) */
+#define FA_BLOB_PERMD_BCAST 0x20	/* byte 0 of each dword to all 4 bytes */
+#define FA_BLOB_PERMD_OFFS 0x30	/* 0,1,2,3 in each dword */
+#define FA_BLOB_NIBBLE	0x40	/* 0x0f in every byte */
 
 #define FA_MAX_STUB	512	/* upper bound for one translated instruction */
 

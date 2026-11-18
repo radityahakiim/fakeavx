@@ -13,6 +13,7 @@
  *   helperbench sdump "" [N]     pcmpXstrX, all control bytes: state dump for two builds
  *   helperbench gdump "" [N]     gathers, every form and corner case: state dump for two builds
  *   helperbench mgdump "" [N]    the same gathers, executed under the loaded module
+ *   helperbench pdump|mpdump "" [N]   vpermd/vpermps, every aliasing and operand form
  *   helperbench mvexpair [N]     the same, executed under the loaded module
  *   helperbench mdump|mrdump|mrtime   the same instructions and loops run
  *                                natively, so that the loaded fakeavx module
@@ -645,6 +646,66 @@ static void gdump(long cases, int module)
 	      }
 }
 
+/*
+ * pdump: complete state after vpermd / vpermps, register and memory sources
+ * (rsi and r9 bases, positive and negative displacements), with every
+ * aliasing of destination, index and source, and high registers, on random
+ * data and random indices (bits above 2 set too). module: executed natively
+ * (mpdump), so that the loaded module translates it.
+ */
+static void pdump(long cases, int module)
+{
+	static struct hb_state a;
+	static const int sets[][3] = {	/* dest, index (vvvv), source (rm) */
+		{ 0, 1, 2 }, { 0, 0, 1 }, { 0, 1, 0 }, { 0, 1, 1 }, { 3, 3, 3 }, { 9, 12, 15 }, { 15, 8, 8 }, { 7, 14, 7 },
+	};
+	u8 *stub = code + 0x10000, ins[16];
+	u8 *page = module ? mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+				 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) : NULL;
+
+	for (int opc = 0; opc < 2; opc++)
+	 for (int si = 0; si < 8; si++)
+	  for (int form = 0; form < 3; form++) {	/* register, 8(%rsi), -24(%r9) */
+		int D = sets[si][0], I = sets[si][1], S = sets[si][2], k = 0, base = form == 2 ? 9 : 6;
+		struct hb_ent e = { "p", ins, 0 };
+		char name[48];
+
+		ins[k++] = 0xc4;
+		ins[k++] = 0x02 | (D < 8 ? 0x80 : 0) | 0x40 | ((form ? base : S) < 8 ? 0x20 : 0);
+		ins[k++] = ((~I & 15) << 3) | 0x04 | 1;			/* W0, L1, 66 */
+		ins[k++] = opc ? 0x16 : 0x36;				/* vpermps / vpermd */
+		if (form == 0) {
+			ins[k++] = 0xc0 | ((D & 7) << 3) | (S & 7);
+		} else {
+			ins[k++] = 0x40 | ((D & 7) << 3) | (base & 7);
+			ins[k++] = form == 1 ? 8 : (u8)-24;
+		}
+		e.end = ins + k;
+		if (module) {
+			memcpy(page, ins, k);
+			page[k] = 0xc3;
+		} else {
+			build(&e, 1, stub);
+		}
+		for (long c = 0; c < cases; c++) {
+			fill(&a, "pdump", c * 977 + opc * 131 + si * 17 + form);
+			if (form == 2)
+				a.gp[9] = (u64)a.mem + 256;
+			if (module) {
+				hb_mrun(&a, page);
+			} else {
+				put_hi(&a);
+				hb_once(&a, stub);
+				get_hi(&a);
+			}
+			if (form == 2)
+				a.gp[9] -= (u64)a.mem;
+			snprintf(name, sizeof(name), "%s/s%d/f%d", opc ? "vpermps" : "vpermd", si, form);
+			print_state(name, c, &a);
+		}
+	  }
+}
+
 static void dump(const char *filter, long cases)
 {
 	static struct hb_state s;
@@ -903,6 +964,10 @@ int main(int argc, char **argv)
 	memcpy(st + FA_ST_MAGIC, &v, 8);
 	if (mode[0] == 'm') {		/* the module handles this process: no %gs of our own */
 		setvbuf(stdout, NULL, _IOFBF, 1 << 20);
+		if (!strcmp(mode, "mpdump")) {
+			pdump(argc > 3 ? atol(argv[3]) : 2000, 1);
+			return 0;
+		}
 		if (!strcmp(mode, "mgdump")) {
 			gdump(argc > 3 ? atol(argv[3]) : 10, 1);
 			return 0;
@@ -925,6 +990,10 @@ int main(int argc, char **argv)
 	CPU_SET(sched_getcpu(), &set);
 	sched_setaffinity(0, sizeof(set), &set);
 	setvbuf(stdout, NULL, getenv("HB_UNBUF") ? _IONBF : _IOFBF, 1 << 20);
+	if (!strcmp(mode, "pdump")) {
+		pdump(argc > 3 ? atol(argv[3]) : 2000, 0);
+		return 0;
+	}
 	if (!strcmp(mode, "gdump")) {
 		gdump(argc > 3 ? atol(argv[3]) : 10, 0);	/* gdump "" N, like the other modes */
 		return 0;

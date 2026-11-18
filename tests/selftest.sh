@@ -194,10 +194,12 @@ if [ $do_module = 1 ]; then
 	cmp <("$HB" gdump "" 10) <("$HB" mgdump "" 10) >>"$logs/mdump.log" 2>&1
 	rc3=$?
 	[ $rc3 = 0 ] || rc1=1
+	cmp <("$HB" pdump "" 300) <("$HB" mpdump "" 300) >>"$logs/mdump.log" 2>&1
+	[ $? = 0 ] || rc1=1
 	secs=$(( $(date +%s) - t0 ))
 	nins=$("$HB" dump "" 1 | wc -l); nloop=$("$HB" rdump "" 1 | wc -l)
 	if [ $rc1 = 0 ] && [ $rc2 = 0 ]; then
-		record "module vs userspace translator" PASS "$nins instructions + $nloop loops x $N_DUMP inputs, 2048 gather encodings x 10, identical" $secs
+		record "module vs userspace translator" PASS "$nins instructions + $nloop loops x $N_DUMP inputs, 2048 gather encodings x 10, 48 vpermd/vpermps forms x 300, identical" $secs
 	else
 		record "module vs userspace translator" FAIL "differs: see mdump.log" $secs
 	fi
