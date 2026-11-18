@@ -33,3 +33,6 @@ __pycache__/
 /tests/divert_check
 /tests/divert_truth.txt
 /tests/helperbench
+
+# benchmark kernels (bench/fakeavx-bench.ts builds them)
+/bench/build/
