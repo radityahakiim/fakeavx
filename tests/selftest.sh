@@ -83,7 +83,7 @@ run() {
 have() { command -v "$1" >/dev/null 2>&1; }
 
 P=/sys/module/fakeavx/parameters
-STATS="slow fast translated regions regions_borrowing patched patched_short unpatched diverted evicted evict_traps unsupported"
+STATS="slow fast translated regions regions_borrowing patched patched_short unpatched diverted evicted evicted_int evict_traps evict_undone unsupported"
 stats() { for s in $STATS; do printf '%s=%s ' "$s" "$(cat "$P/stat_$s" 2>/dev/null || echo 0)"; done; }
 
 module_loaded=0

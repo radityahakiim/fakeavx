@@ -79,7 +79,8 @@ MODULE_PARM_DESC(force, "load even if the CPU already supports AVX (for testing 
 
 static unsigned long stat_fast, stat_slow, stat_translated, stat_patched, stat_patched_short,
 	stat_patched_int, stat_regions, stat_regions_borrowing, stat_unsupported,
-	stat_short_refused, stat_unpatched, stat_diverted, stat_evicted, stat_evict_traps;
+	stat_short_refused, stat_unpatched, stat_diverted, stat_evicted, stat_evicted_int,
+	stat_evict_traps, stat_evict_undone;
 module_param(stat_fast, ulong, 0444);
 module_param(stat_slow, ulong, 0444);
 module_param(stat_translated, ulong, 0444);
@@ -93,7 +94,9 @@ module_param(stat_short_refused, ulong, 0444);
 module_param(stat_unpatched, ulong, 0444);
 module_param(stat_diverted, ulong, 0444);
 module_param(stat_evicted, ulong, 0444);
+module_param(stat_evicted_int, ulong, 0444);
 module_param(stat_evict_traps, ulong, 0444);
+module_param(stat_evict_undone, ulong, 0444);
 
 static bool evict = true;
 module_param(evict, bool, 0644);
@@ -106,7 +109,10 @@ struct fa_tr {
 	u8 len;
 	u8 bytes[15];		/* what guest memory holds at this address */
 	u8 dv_tried;		/* fa_divert() has been tried */
-	u8 evicted;		/* first byte(s) rewritten by eviction: see fa_ev_window() */
+	u8 evicted;		/* first byte(s) rewritten by eviction (fa_ev_window()): */
+#define FA_EV_OURS	1	/*   an instruction of ours */
+#define FA_EV_INT	2	/*   an integer instruction: undone when entered too often */
+	u64 ev_rec;		/* then: its struct fa_ev_rec in the code cache */
 	u32 unp;		/* its entry in /proc/fakeavx/unpatched, if any */
 	atomic_long_t hits;	/* traps since then */
 	struct rcu_head rcu;
@@ -534,7 +540,7 @@ static bool fa_near(unsigned long a, unsigned long b)
 /* Why an instruction that should have been patched was not (it then traps every time). */
 enum {
 	FW_OK, FW_HEAP, FW_STACK, FW_RANGE, FW_BUSY, FW_LIMIT, FW_NOMEM,
-	FW_BORROWED, FW_BYTES, FW_REL, FW_POKE,
+	FW_BORROWED, FW_BYTES, FW_REL, FW_POKE, FW_EVHOT,
 };
 
 static const char *const fa_why[] = {
@@ -549,6 +555,7 @@ static const char *const fa_why[] = {
 	[FW_BYTES] = "the bytes after it do not match the jump (they changed)",
 	[FW_REL] = "its stub is out of jump range",
 	[FW_POKE] = "the code could not be written",
+	[FW_EVHOT] = "the integer instruction after it, rewritten so it could be patched, was jumped to too often",
 };
 
 /* Keep clear of where the heap and the stack may still want to grow. */
@@ -859,10 +866,19 @@ static int fa_patch_site(struct fa_mm *fm, struct fa_tr *tr, unsigned long ip,
 struct fa_ev_rec {
 	u32 magic;
 	u8 len;			/* the rewritten instruction's length */
-	u8 pad[3];
-	u64 ip;			/* its address */
+	u8 nf;			/* how many of its bytes were rewritten (1, 2) */
+	u8 kind;		/* FA_EV_OURS, FA_EV_INT */
+	u8 slen;		/* the short instruction's length (5 - nf) */
+	u64 ip;			/* the rewritten instruction's address */
 	u64 entry;		/* where it is translated */
+	u64 sip;		/* the short instruction's address */
+	u8 s_orig[4];		/* the short instruction's bytes, before its jump */
+	u8 n_orig[2];		/* the rewritten bytes, before */
+	u8 pad[2];
 };
+
+/* An evicted integer instruction entered directly this often gets its bytes back. */
+#define FA_EVICT_HITS	16
 
 #define FA_EV_SIZE	(FA_EV_OFF + sizeof(struct fa_ev_rec))
 
@@ -963,15 +979,80 @@ static struct fa_tr *fa_evicted_find(struct fa_mm *fm, unsigned long ip, const u
 
 		if (!stub || copy_from_user(&rec, (void __user *)(stub + FA_EV_OFF), sizeof(rec)))
 			continue;
-		if (rec.magic != FA_EV_MAGIC || rec.ip != ip || rec.len < 5 - j || rec.len > n ||
-		    rec.len > 15 || !fa_in_cache(fm, rec.entry))
+		if (rec.magic != FA_EV_MAGIC || rec.ip != ip || rec.sip != ip - j || rec.slen != j ||
+		    rec.nf != 5 - j || rec.len < rec.nf || rec.len > n || rec.len > 15 ||
+		    (rec.kind != FA_EV_OURS && rec.kind != FA_EV_INT) || !fa_in_cache(fm, rec.entry))
 			continue;
 		tr = fa_tr_store(fm, ip, rec.entry, buf, rec.len);
-		if (tr)
-			tr->evicted = 1;
+		if (tr) {
+			tr->evicted = rec.kind;
+			tr->ev_rec = stub + FA_EV_OFF;
+		}
 		return tr;
 	}
 	return NULL;
+}
+
+static u32 fa_report_unpatched(struct fa_mm *fm, unsigned long ip, const u8 *bytes, int len,
+				int why, unsigned long lo, unsigned long hi);
+
+/*
+ * An evicted integer instruction (tr, at ip) is entered directly too often:
+ * give it its bytes back, and the short instruction before it, whose jump
+ * borrowed them, goes back to trapping. That instruction traps by nature
+ * (it is one of ours), so the order is: its byte 0 -> 0xc4 (a VEX prefix,
+ * traps whatever follows), its other bytes back, the integer instruction's
+ * bytes back (last first), then its own byte 0; a serializing IPI after each.
+ * Called with fm->lock held.
+ */
+static void fa_ev_undo(struct fa_mm *fm, unsigned long ip, struct fa_tr *tr)
+{
+	struct fa_ev_rec rec;
+	struct fa_tr *str;
+	u8 b[5], c4 = 0xc4;
+	int k;
+
+	if (copy_from_user(&rec, (void __user *)tr->ev_rec, sizeof(rec)) ||
+	    rec.magic != FA_EV_MAGIC || rec.ip != ip || rec.kind != FA_EV_INT ||
+	    rec.slen < 3 || rec.slen > 4 || rec.nf != 5 - rec.slen || rec.sip + rec.slen != ip)
+		return;
+	if (copy_from_user(b, (void __user *)rec.sip, 5) || b[0] != 0xe9 ||
+	    memcmp(b + rec.slen, tr->bytes, rec.nf))
+		return;		/* not the state eviction left */
+	/*
+	 * The short instruction's record follows memory at every step, so a
+	 * thread trapping there in between (or after a failed write) is sent
+	 * to its stub rather than having c4 ... decoded as something else. A
+	 * forked child may lack it: its stub is the one this record follows.
+	 */
+	str = xa_load(&fm->tr, rec.sip);
+	if (!str || str->len != rec.slen || memcmp(str->bytes, b, rec.slen))
+		str = fa_tr_store(fm, rec.sip, tr->ev_rec - FA_EV_OFF, b, rec.slen);
+	if (!str)
+		return;
+
+	if (fa_poke(rec.sip, &c4, 1))
+		return;
+	str->bytes[0] = c4;
+	on_each_cpu(fa_nop, NULL, 1);
+	if (fa_poke(rec.sip + 1, rec.s_orig + 1, rec.slen - 1))
+		return;
+	memcpy(str->bytes + 1, rec.s_orig + 1, rec.slen - 1);
+	on_each_cpu(fa_nop, NULL, 1);
+	for (k = rec.nf - 1; k >= 0; k--) {
+		if (fa_poke(ip + k, rec.n_orig + k, 1))
+			return;
+		tr->bytes[k] = rec.n_orig[k];
+		on_each_cpu(fa_nop, NULL, 1);
+	}
+	tr->evicted = 0;
+	if (fa_poke(rec.sip, rec.s_orig, 1))
+		return;
+	str->bytes[0] = rec.s_orig[0];
+	on_each_cpu(fa_nop, NULL, 1);
+	if (!str->unp)
+		str->unp = fa_report_unpatched(fm, rec.sip, rec.s_orig, rec.slen, FW_EVHOT, 0, 0);
+	stat_evict_undone++;
 }
 
 /*
@@ -1166,32 +1247,53 @@ static int fa_rd(void *ctx, u64 addr, u8 *buf, int n)
 	return fa_read_insn(addr, buf);
 }
 
+static struct fa_tr *fa_make_entry(struct fa_mm *fm, struct fa_region *main,
+				   const struct fa_rgn *rg, const struct fa_ritem *it,
+				   bool may_patch);
+
 /*
  * May the instruction after it (short, its jump window unusable) be evicted
  * (see fa_ev_window())? It must follow it in the same block of the region,
- * be translated with an entry, and its first bytes must still be what its
- * record says and borrowed by nothing. cur: the 5 bytes from it->ip.
+ * its first bytes must be what the region read and borrowed by nothing, and
+ * its own jump (if it is short) must not be what leads a forked child to
+ * another eviction record.
+ *
+ * An instruction of ours already has its record and entry. An integer one
+ * the region carries gets them here (it never trapped, so it has none: one
+ * that has, e.g. from fa_divert(), is left alone); *kind tells which.
+ * cur: the 5 bytes from it->ip.
  */
-static struct fa_tr *fa_ev_next(struct fa_mm *fm, const struct fa_rgn *rg,
-				const struct fa_ritem *it, const u8 *cur)
+static struct fa_tr *fa_ev_next(struct fa_mm *fm, struct fa_region *main,
+				const struct fa_rgn *rg, const struct fa_ritem *it,
+				const u8 *cur, int *kind)
 {
 	const struct fa_ritem *nx = it + 1;
 	int nf = 5 - it->len;
 	struct fa_tr *ntr, *nt2;
 
 	if (nx >= rg->it + rg->n || it->has_link || nx->ip != it->ip + it->len ||
-	    nx->kind != FA_R_OURS)
+	    (nx->kind != FA_R_OURS && nx->kind != FA_R_PLAIN) || nx->len < nf)
 		return NULL;
 	ntr = xa_load(&fm->tr, nx->ip);
-	if (!ntr || !ntr->stub || ntr->evicted || ntr->len < nf ||
-	    memcmp(ntr->bytes, cur + it->len, nf))
+	if (nx->kind == FA_R_OURS) {
+		/* patched already, likely (highest address first): its record follows memory */
+		if (!ntr || !ntr->stub || ntr->evicted || ntr->len < nf ||
+		    memcmp(ntr->bytes, cur + it->len, nf))
+			return NULL;
+	} else if (ntr || memcmp(nx->bytes, cur + it->len, nf)) {
+		return NULL;	/* integer: never touched, so still what the region read */
+	}
+	if (fa_borrowed(fm, nx->ip) || !fa_patchable(fm, nx->ip, nx->len))
 		return NULL;
-	if (fa_borrowed(fm, nx->ip) || !fa_patchable(fm, nx->ip, ntr->len))
-		return NULL;
-	/* its own jump may be what leads a forked child to the next eviction record */
-	nt2 = xa_load(&fm->tr, nx->ip + ntr->len);
+	nt2 = xa_load(&fm->tr, nx->ip + nx->len);
 	if (nt2 && nt2->evicted)
 		return NULL;
+	if (nx->kind == FA_R_PLAIN) {
+		ntr = fa_make_entry(fm, main, rg, nx, false);
+		if (!ntr || !ntr->stub)
+			return NULL;
+	}
+	*kind = nx->kind == FA_R_OURS ? FA_EV_OURS : FA_EV_INT;
 	return ntr;
 }
 
@@ -1211,7 +1313,7 @@ static struct fa_tr *fa_make_entry(struct fa_mm *fm, struct fa_region *main,
 	struct fa_region *r = NULL;
 	u8 stub[FA_ENTRY_MAX], cur[5], nb[2], old[2];
 	struct fa_tr *tr, *ntr = NULL;	/* ntr: the next instruction, if evicted */
-	int n, why = FW_OK, nf = 5 - it->len;
+	int n, why = FW_OK, nf = 5 - it->len, ev_kind = 0;
 	u32 unp = 0;
 
 	/* what follows may have been patched since the region was read */
@@ -1228,9 +1330,14 @@ static struct fa_tr *fa_make_entry(struct fa_mm *fm, struct fa_region *main,
 		lo = ip + 5 + (long)(s32)(fixed << shift);
 		r = fa_window_get(fm, lo, lo + (1UL << shift), FA_ENTRY_MAX, &addr, &why);
 		if (!r && evict && it->kind == FA_R_OURS) {
-			ntr = fa_ev_next(fm, rg, it, cur);
+			ntr = fa_ev_next(fm, main, rg, it, cur, &ev_kind);
 			if (ntr)
 				r = fa_ev_window(fm, ip, it->len, &addr, nb);
+			if (!r && ntr && ev_kind == FA_EV_INT) {
+				/* made for nothing: an integer instruction needs no record */
+				xa_erase(&fm->tr, ip + it->len);
+				kfree_rcu(ntr, rcu);
+			}
 			if (!r)
 				ntr = NULL;
 		}
@@ -1257,10 +1364,12 @@ static struct fa_tr *fa_make_entry(struct fa_mm *fm, struct fa_region *main,
 		r->used = addr + ALIGN(n, 16) - r->start;
 		if (ntr) {
 			struct fa_ev_rec rec = {
-				.magic = FA_EV_MAGIC, .len = ntr->len,
-				.ip = ip + it->len, .entry = ntr->stub,
+				.magic = FA_EV_MAGIC, .len = ntr->len, .nf = nf, .kind = ev_kind,
+				.slen = it->len, .ip = ip + it->len, .entry = ntr->stub, .sip = ip,
 			};
 
+			memcpy(rec.s_orig, it->bytes, it->len);
+			memcpy(rec.n_orig, ntr->bytes, nf);
 			if (fa_poke(addr + FA_EV_OFF, &rec, sizeof(rec)))
 				return NULL;
 			r->used = addr + ALIGN(FA_EV_SIZE, 16) - r->start;
@@ -1284,8 +1393,12 @@ static struct fa_tr *fa_make_entry(struct fa_mm *fm, struct fa_region *main,
 				}
 			unp = fa_report_unpatched(fm, ip, it->bytes, it->len, why, 0, 0);
 		} else {
-			ntr->evicted = 1;
+			atomic_long_set(&ntr->hits, 0);
+			ntr->ev_rec = addr + FA_EV_OFF;
+			ntr->evicted = ev_kind;
 			stat_evicted++;
+			if (ev_kind == FA_EV_INT)
+				stat_evicted_int++;
 		}
 		want_patch = false;
 	}
@@ -1570,6 +1683,11 @@ static void fa_slow(struct pt_regs *regs)
 found:
 	if (!tr->stub)
 		goto out;
+	if (tr->evicted == FA_EV_INT && atomic_long_read(&tr->hits) >= FA_EVICT_HITS) {
+		fa_ev_undo(fm, ip, tr);
+		if (!tr->evicted)
+			goto out;	/* its own bytes again: it runs as it is */
+	}
 	if (tr->unp && !tr->dv_tried && atomic_long_read(&tr->hits) >= FA_DIVERT_HITS &&
 	    divert && patch) {
 		tr->dv_tried = 1;
@@ -1618,10 +1736,14 @@ static int fa_die(struct notifier_block *nb, unsigned long val, void *data)
 					    !READ_ONCE(tr->dv_tried) && READ_ONCE(divert) && patch)
 						goto slow;
 				}
+				if (tr->evicted) {
+					stat_evict_traps++;
+					if (tr->evicted == FA_EV_INT &&
+					    atomic_long_inc_return(&tr->hits) >= FA_EVICT_HITS)
+						goto slow;	/* fa_ev_undo() */
+				}
 				regs->ip = tr->stub;
 				stat_fast++;
-				if (tr->evicted)
-					stat_evict_traps++;
 				return NOTIFY_STOP;
 			}
 		}

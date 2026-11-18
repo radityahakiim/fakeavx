@@ -1,7 +1,11 @@
 /*
  * Provokes refused short patches: the stub window of a 4-byte AVX
- * instruction followed by "paddd" (first byte 0x66) lies ~1.6 GB above it.
- * This program reserves that area first, so fakeavx cannot place the stub.
+ * instruction followed by "data16 fnop" (66 d9 d0, first byte 0x66) lies
+ * ~1.6 GB above it. This program reserves that area first, so fakeavx
+ * cannot place the stub. No decoder of fakeavx accepts that fnop, so
+ * regions stop before it and it cannot be evicted either (kmod/main.c,
+ * fa_ev_next(); an evictable neighbor like "paddd" would be, and nothing
+ * would be left to test here).
  *
  *  - loop(): the instruction is a loop head, reached by a jump. It must
  *    still run correctly (trapping every time), and /proc/fakeavx/unpatched
@@ -35,6 +39,7 @@ __asm__(
 	"dv_func:\n"
 	"	mov $0x12345678, %eax\n"	/* b8 imm32: 5 bytes, gets the jump */
 	"	vpaddd %ymm1, %ymm2, %ymm0\n"	/* c5 ed fe c1: window refused */
+	"	.byte 0x66, 0xd9, 0xd0\n"	/* data16 fnop: not evictable */
 	"	paddd %xmm7, %xmm4\n"		/* 66 0f fe e7 */
 	"	ret\n"
 	"int3\n"
@@ -67,6 +72,7 @@ __attribute__((noinline)) static void loop(int n, int *out)
 		"movdqu (%2), %%xmm7\n\t"
 		"1:\n\t"
 		"vpaddd %%ymm1, %%ymm2, %%ymm0\n\t"	/* c5 ed fe c1: 4 bytes */
+		".byte 0x66, 0xd9, 0xd0\n\t"		/* data16 fnop: not evictable */
 		"paddd %%xmm7, %%xmm4\n\t"		/* 66 0f fe e7 */
 		"dec %0\n\t"
 		"jnz 1b\n\t"

@@ -105,9 +105,9 @@ Module parameters (`/etc/modprobe.d/fakeavx.conf`, or
 | `policy` | 1 | 1: every process unless it has `FAKEAVX=0`. 0: only processes started with `FAKEAVX=1`. |
 | `patch` | 1 | Overwrite translated instructions with a jump. 0 traps on every execution (slow; for debugging). |
 | `divert` | 1 | When an instruction that could not be patched keeps trapping, patch the instruction before it instead (below). |
-| `evict` | 1 | When a 3-4 byte instruction's jump window is unusable, rewrite the first byte(s) of the next instruction (if it is translated in the same region) to move the window (below). |
+| `evict` | 1 | When a 3-4 byte instruction's jump window is unusable, rewrite the first byte(s) of the next instruction (one the same region translates or carries) to move the window (below). |
 | `autocpuid` | 1 | Find a binary's `cpuid` instructions automatically (below). |
-| `stat_*` | — | Read-only counters, e.g. `stat_slow` (first-time traps), `stat_fast` (repeat traps), `stat_regions`, `stat_patched`, `stat_cpuid`, `stat_scans`, `stat_unsupported`, `stat_short_refused` (3-4 byte instructions left trapping because their stub window was unavailable), `stat_unpatched` (all instructions left trapping, for any reason), `stat_diverted` (of those, how many were then diverted at the instruction before), `stat_evicted` (short instructions patched by rewriting the next one), `stat_evict_traps` (direct jumps into such a rewritten instruction, each a trap). |
+| `stat_*` | — | Read-only counters, e.g. `stat_slow` (first-time traps), `stat_fast` (repeat traps), `stat_regions`, `stat_patched`, `stat_cpuid`, `stat_scans`, `stat_unsupported`, `stat_short_refused` (3-4 byte instructions left trapping because their stub window was unavailable), `stat_unpatched` (all instructions left trapping, for any reason), `stat_diverted` (of those, how many were then diverted at the instruction before), `stat_evicted` (short instructions patched by rewriting the next one; `stat_evicted_int`: of them, where the next one is an integer instruction), `stat_evict_traps` (direct jumps into such a rewritten instruction, each a trap), `stat_evict_undone` (integer instructions given their bytes back after 16 such jumps). |
 
 `stat_fast` is the number to watch: every count is a full kernel round trip.
 If it keeps climbing while a program runs, that program has hot instructions
@@ -279,12 +279,13 @@ register, and prints both values when they differ.
   Their jump takes its top displacement byte(s) from the next instruction;
   a VEX prefix (`c4`/`c5`) or any byte ≥ 0x80 there puts the stub 1–2 GB
   below the instruction, which for an executable loaded at a few MB does not
-  exist. When the next instruction is translated in the same region,
+  exist. When the same region translates or carries the next instruction,
   `evict` rewrites its first byte(s) into an opcode that is invalid in
   64-bit mode and that moves the window above the heap: the region runs that
-  instruction from its translation, and a jump straight to it traps into its
+  instruction from the cache, and a jump straight to it traps into its
   record (after `fork()`, the child finds it through a record kept in the
-  code cache). Otherwise an earlier integer instruction is patched instead
+  code cache). An integer instruction, which would not trap otherwise, gets
+  its bytes back after 16 such jumps, and the short instruction traps again. Otherwise an earlier integer instruction is patched instead
   where possible (`divert`). What is left — e.g. `vzeroupper` before `ret`,
   or an instruction right after a `call` — still traps once per execution.
   Watch `/proc/fakeavx/unpatched`; building with `-fPIE -pie` or
