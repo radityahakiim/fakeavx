@@ -238,7 +238,9 @@ register, and prints both values when they differ.
   about 330 instruction forms, see `core/optable.c`.
 - POPCNT (16/32/64-bit, exact flags).
 - SSE4.2 in its legacy encoding: `pcmpgtq`, `crc32`, `pcmpestri`, `pcmpestrm`,
-  `pcmpistri`, `pcmpistrm` (all control-byte variants). These go through the
+  `pcmpistri`, `pcmpistrm` (all control-byte variants), and the VEX.128 forms
+  `vpcmpestri`, `vpcmpestrm`, `vpcmpistri`, `vpcmpistrm` that `-mavx`/`-mavx2`
+  code uses. These go through the
   out-of-line helper, so they are correct but not fast, and they do not set
   floating-point exception flags in MXCSR.
 - SSE4.1 (legacy and VEX encodings) on CPUs that only have SSSE3.

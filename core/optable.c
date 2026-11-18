@@ -211,6 +211,11 @@ static const struct fa_op fa_ops[] = {
 	OPI(3, 0x4a, P66, FA_S_BLENDV, 0),
 	OPI(3, 0x4b, P66, FA_S_BLENDV, 0),
 	OPI(3, 0x4c, P66, FA_S_BLENDV, 0),
+	/* SSE4.2 string compares, VEX.128 only (VEX.vvvv must be 1111: decode.c) */
+	OPI(3, 0x60, P66, FA_S_HELPER, FA_F_L0),		/* vpcmpestrm */
+	OPI(3, 0x61, P66, FA_S_HELPER, FA_F_L0),		/* vpcmpestri */
+	OPI(3, 0x62, P66, FA_S_HELPER, FA_F_L0),		/* vpcmpistrm */
+	OPI(3, 0x63, P66, FA_S_HELPER, FA_F_L0),		/* vpcmpistri */
 };
 
 const struct fa_op *fa_lookup(u8 map, u8 pp, u8 opcode)

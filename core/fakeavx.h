@@ -294,6 +294,8 @@ static inline int fa_helper_lean(const struct fa_insn *in)
 		return !fa_is_sse41(in->map, in->opcode);	/* pcmpXstrX, pcmpgtq, crc32 */
 	if (in->map == 1 && in->opcode == 0xc2)
 		return 0;					/* vcmp* */
+	if (in->map == 3)
+		return in->opcode >= 0x60 && in->opcode <= 0x63;	/* vpcmpXstrX */
 	return in->map == 2 && !fa_is_sse41(in->map, in->opcode);
 }
 
@@ -309,8 +311,8 @@ static inline u16 fa_helper_xmm(const struct fa_insn *in)
 	else if (in->kind == FA_K_VEX && in->mem.has_index &&
 		 in->map == 2 && in->opcode >= 0x90 && in->opcode <= 0x93)
 		m |= 1 << in->mem.index;			/* VSIB */
-	if (in->kind == FA_K_SSE4 && in->map == 3 && !(in->opcode & 1))
-		m |= 1;						/* pcmpXstrm writes xmm0 */
+	if (in->map == 3 && in->opcode >= 0x60 && in->opcode <= 0x63 && !(in->opcode & 1))
+		m |= 1;					/* (v)pcmpXstrm writes xmm0 */
 	return m;
 }
 

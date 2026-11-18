@@ -163,6 +163,9 @@ int fa_decode(const u8 *code, u32 avail, u64 rip, struct fa_insn *in)
 			return -1;
 		if ((op->flags & FA_F_REGONLY) && in->mod != 3)
 			return -1;
+		/* vpcmpXstrX have no vvvv operand: anything but 1111 is #UD */
+		if (in->map == 3 && in->opcode >= 0x60 && in->opcode <= 0x63 && in->vvvv)
+			return -1;
 		if (in->mem.seg == 0x65 && in->mod != 3)
 			return -1;	/* %gs is ours */
 		in->len = n;

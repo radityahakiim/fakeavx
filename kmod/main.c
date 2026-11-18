@@ -1303,7 +1303,10 @@ static void fa_slow(struct pt_regs *regs)
 	tr = xa_load(&fm->tr, ip);
 	if (!tr || n < tr->len || memcmp(buf, tr->bytes, tr->len)) {
 		if (fa_decode(buf, n, ip, &in) < 0) {
+			/* an encoding the decoder does not know: say so, the program dies */
 			stat_unsupported++;
+			pr_info_ratelimited("%s[%d]: unsupported instruction at %lx: %*ph\n",
+					    current->comm, current->pid, ip, min(n, 15), buf);
 			if (!fa_tr_store(fm, ip, 0, buf, min(n, 15)))
 				force_sig(SIGILL);
 			goto out;

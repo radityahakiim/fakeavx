@@ -9,6 +9,8 @@
  *   helperbench dump [filter]    complete state after each instruction, for
  *                                many random inputs: run it from two builds and
  *                                cmp the outputs (old blob = oracle)
+ *   helperbench vexpair [N]      VEX vpcmpXstrX against their legacy encodings
+ *   helperbench mvexpair [N]     the same, executed under the loaded module
  *   helperbench mdump|mrdump|mrtime   the same instructions and loops run
  *                                natively, so that the loaded fakeavx module
  *                                translates them (compare with dump / rdump)
@@ -272,6 +274,159 @@ static void mrtiming(const char *filter)
 #undef s
 }
 
+/*
+ * vexpair: VEX.128 vpcmpXstrX against their legacy encodings, which go
+ * through the same helper and are verified against hardware by difftest:
+ * all four instructions x 256 control bytes x register/memory operand x
+ * W=0/1 (explicit lengths), on string-like inputs. Results must be identical,
+ * except that the VEX ...strm forms also zero ymm0[255:128].
+ */
+static int vexpair(long cases)
+{
+	static struct hb_state a, b;
+	u8 *sl = code + 0x10000, *sv = code + 0x11000, ins[16];
+	long n = 0, bad = 0;
+
+	for (int op = 0x60; op <= 0x63; op++)
+		for (int mem = 0; mem < 2; mem++)
+			for (int w = 0; w < (op <= 0x61 ? 2 : 1); w++)
+				for (int imm = 0; imm < 256; imm++) {
+					struct hb_ent el = { "legacy", ins, 0 }, ev = { "vex", ins + 8, 0 };
+					u8 modrm = mem ? 0x4e : 0xca;	/* xmm1, 16(%rsi) | xmm2 */
+					int k = 0;
+
+					/* legacy: 66 [48] 0f 3a op modrm [disp8] imm */
+					ins[k++] = 0x66;
+					if (w)
+						ins[k++] = 0x48;
+					ins[k++] = 0x0f; ins[k++] = 0x3a; ins[k++] = op; ins[k++] = modrm;
+					if (mem)
+						ins[k++] = 0x10;
+					ins[k++] = imm;
+					el.end = ins + k;
+					/* VEX3: c4 e3 (W vvvv=1111 L=0 pp=01) op modrm [disp8] imm */
+					k = 8;
+					ins[k++] = 0xc4; ins[k++] = 0xe3; ins[k++] = (w << 7) | 0x79;
+					ins[k++] = op; ins[k++] = modrm;
+					if (mem)
+						ins[k++] = 0x10;
+					ins[k++] = imm;
+					ev.end = ins + k;
+					build(&el, 1, sl);
+					build(&ev, 1, sv);
+					for (long c = 0; c < cases; c++, n++) {
+						fill(&a, "vexpair", c * 1000 + imm);
+						for (int i = 0; i < 16; i++) {	/* short alphabets, zeros */
+							a.xmm[1][i] = rnd() % 5;
+							a.xmm[2][i] = rnd() % 5;
+							a.mem[16 + i] = rnd() % 5;
+						}
+						a.gp[0] = (u64)(s64)((int)(rnd() % 41) - 20);
+						a.gp[2] = (u64)(s64)((int)(rnd() % 41) - 20);
+						if (c % 16 == 5)
+							a.gp[0] = 0x80000000u;	/* |INT_MIN| saturation */
+						if (c % 16 == 9)
+							a.gp[2] = 0xffffffff00000003ull;	/* W decides */
+						b = a;
+						put_hi(&a);
+						hb_once(&a, sl);
+						get_hi(&a);
+						put_hi(&b);
+						hb_once(&b, sv);
+						get_hi(&b);
+						if (!(op & 1))
+							memset(a.hi[0], 0, 16);	/* what VEX must do */
+						if (memcmp(&a, &b, sizeof(a))) {
+							if (bad++ < 5)
+								printf("MISMATCH op %#x imm %#04x mem %d W %d case %ld\n",
+								       op, imm, mem, w, c);
+						}
+					}
+				}
+	/* what the hardware rejects (#UD) the decoder must reject too */
+	for (int op = 0x60; op <= 0x63; op++) {
+		const u8 ok[] = { 0xc4, 0xe3, 0x79, op, 0xca, 0x0c };
+		const u8 l1[] = { 0xc4, 0xe3, 0x7d, op, 0xca, 0x0c };		/* VEX.L = 1 */
+		const u8 vv[] = { 0xc4, 0xe3, 0x71, op, 0xca, 0x0c };		/* vvvv = xmm1 */
+		struct fa_insn in;
+
+		if (fa_decode(ok, sizeof(ok), 0, &in) || in.len != 6) {
+			printf("valid encoding of op %#x rejected\n", op);
+			bad++;
+		}
+		if (!fa_decode(l1, sizeof(l1), 0, &in) || !fa_decode(vv, sizeof(vv), 0, &in)) {
+			printf("invalid encoding of op %#x (L=1 or vvvv != 1111) accepted\n", op);
+			bad++;
+		}
+	}
+	printf("vexpair: %ld cases (4 instructions x 256 control bytes x reg/mem x W), %ld mismatches;"
+	       " L=1 and vvvv!=1111 rejected\n", n, bad);
+	return bad != 0;
+}
+
+/*
+ * mvexpair: the same comparison, but both encodings executed natively, so
+ * that the loaded fakeavx module decodes and translates them. The code goes
+ * into an anonymous executable page (rewritten for every case; the module
+ * notices changed bytes and translates again).
+ */
+static int mvexpair(long cases)
+{
+	static struct hb_state a, b;
+	u8 *pl = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	u8 *pv = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	long n = 0, bad = 0;
+
+	if (pl == MAP_FAILED || pv == MAP_FAILED)
+		return 2;
+	for (int op = 0x60; op <= 0x63; op++)
+		for (int mem = 0; mem < 2; mem++)
+			for (int w = 0; w < (op <= 0x61 ? 2 : 1); w++)
+				for (int imm = 0; imm < 256; imm++) {
+					u8 modrm = mem ? 0x4e : 0xca;
+					int k = 0;
+
+					pl[k++] = 0x66;
+					if (w)
+						pl[k++] = 0x48;
+					pl[k++] = 0x0f; pl[k++] = 0x3a; pl[k++] = op; pl[k++] = modrm;
+					if (mem)
+						pl[k++] = 0x10;
+					pl[k++] = imm;
+					pl[k] = 0xc3;
+					k = 0;
+					pv[k++] = 0xc4; pv[k++] = 0xe3; pv[k++] = (w << 7) | 0x79;
+					pv[k++] = op; pv[k++] = modrm;
+					if (mem)
+						pv[k++] = 0x10;
+					pv[k++] = imm;
+					pv[k] = 0xc3;
+					for (long c = 0; c < cases; c++, n++) {
+						fill(&a, "vexpair", c * 1000 + imm);
+						for (int i = 0; i < 16; i++) {
+							a.xmm[1][i] = rnd() % 5;
+							a.xmm[2][i] = rnd() % 5;
+							a.mem[16 + i] = rnd() % 5;
+						}
+						a.gp[0] = (u64)(s64)((int)(rnd() % 41) - 20);
+						a.gp[2] = (u64)(s64)((int)(rnd() % 41) - 20);
+						if (c % 16 == 5)
+							a.gp[0] = 0x80000000u;
+						if (c % 16 == 9)
+							a.gp[2] = 0xffffffff00000003ull;
+						b = a;
+						hb_mrun(&a, pl);
+						hb_mrun(&b, pv);
+						if (!(op & 1))
+							memset(a.hi[0], 0, 16);
+						if (memcmp(&a, &b, sizeof(a)) && bad++ < 5)
+							printf("MISMATCH op %#x imm %#04x mem %d W %d case %ld\n", op, imm, mem, w, c);
+					}
+				}
+	printf("mvexpair (under the module): %ld cases, %ld mismatches\n", n, bad);
+	return bad != 0;
+}
+
 static void dump(const char *filter, long cases)
 {
 	static struct hb_state s;
@@ -530,6 +685,8 @@ int main(int argc, char **argv)
 	memcpy(st + FA_ST_MAGIC, &v, 8);
 	if (mode[0] == 'm') {		/* the module handles this process: no %gs of our own */
 		setvbuf(stdout, NULL, _IOFBF, 1 << 20);
+		if (!strcmp(mode, "mvexpair"))
+			return mvexpair(argc > 2 ? atol(argv[2]) : 50);
 		if (!strcmp(mode, "mdump"))
 			mdump(hb_table, hb_table_end, filter, argc > 3 ? atol(argv[3]) : 2000, 0);
 		else if (!strcmp(mode, "mrtime"))
@@ -546,6 +703,8 @@ int main(int argc, char **argv)
 	CPU_SET(sched_getcpu(), &set);
 	sched_setaffinity(0, sizeof(set), &set);
 	setvbuf(stdout, NULL, getenv("HB_UNBUF") ? _IONBF : _IOFBF, 1 << 20);
+	if (!strcmp(mode, "vexpair"))
+		return vexpair(argc > 2 ? atol(argv[2]) : 50);
 	if (!strcmp(mode, "dump"))
 		dump(filter, argc > 3 ? atol(argv[3]) : 2000);
 	else if (!strcmp(mode, "rdump"))

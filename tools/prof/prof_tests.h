@@ -206,6 +206,11 @@ T(lg_pcmpistri, 0, pcmpistri $0x0c, %xmm2, %xmm1)
 T(lg_pcmpestri, 0, pcmpestri $0x0c, %xmm2, %xmm1)
 T(lg_pcmpistrm, 0, pcmpistrm $0x40, %xmm2, %xmm1)
 T(lg_xgetbv, NOCHK, xor %ecx, %ecx; xgetbv)
+/* the VEX.128 forms of the SSE4.2 string compares (what -mavx2 code uses) */
+T(lg_vpcmpistri, 0, vpcmpistri $0x0c, %xmm2, %xmm1)
+T(lg_vpcmpestri, 0, vpcmpestri $0x0c, %xmm2, %xmm1)
+T(lg_vpcmpistrm, 0, vpcmpistrm $0x40, %xmm2, %xmm1)
+T(lg_vpcmpestrm_mem, 0, vpcmpestrm $0x44, 16(%rsi), %xmm1)
 
 /* ---- legacy SSE4.1: native on Penryn, emulated on Merom/Kentsfield ---- */
 T(s41_ptest, 0, ptest %xmm2, %xmm1)

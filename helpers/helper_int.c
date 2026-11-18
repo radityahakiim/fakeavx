@@ -389,6 +389,13 @@ static void do_pcmpstr(const struct fa_insn *in, u64 *gpr, u64 *flags, u8 *st)
 /* integer operations; fa_helper_lean() in fakeavx.h says which */
 void fa_helper_lean_c(const struct fa_insn *in, u64 *gpr, u64 *flags, u8 *st)
 {
+	if (in->kind == FA_K_VEX && in->map == 3) {	/* vpcmpXstrX (VEX.128) */
+		do_pcmpstr(in, gpr, flags, st);
+		/* a VEX.128 write zeroes the upper half; the legacy form keeps it */
+		if (!(in->opcode & 1))
+			memset(st + FA_ST_HI, 0, 16);
+		return;
+	}
 	if (in->kind == FA_K_SSE4) {
 		if (in->map == 3)
 			do_pcmpstr(in, gpr, flags, st);

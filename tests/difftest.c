@@ -734,6 +734,8 @@ static void test_special(int iters)
 			static const char *names[] = { "pcmpgtq", "pcmpestrm", "pcmpestri",
 						       "pcmpistrm", "pcmpistri", "crc32",
 						       "pblendvb", "blendvps", "blendvpd" };
+			static const char *vnames[] = { 0, "vpcmpestrm", "vpcmpestri", "vpcmpistrm", "vpcmpistri" };
+			int vex = 0;
 			static const u8 bv[] = { 0x10, 0x14, 0x15 };
 			int which = rnd() % 9, xr = rnd() & 15, xm = rnd() & 15;
 			int usemem = rnd() & 1, w = rnd() & 1, rex;
@@ -771,6 +773,16 @@ static void test_special(int iters)
 				e.b[n++] = 0x0f; e.b[n++] = 0x38; e.b[n++] = byte ? 0xf0 : 0xf1;
 				e.b[n++] = (usemem ? 0x00 : 0xc0) | ((gr & 7) << 3) | (usemem ? 3 : (gm & 7));
 				r.gpr[3] = (u64)data + (rnd() % 8);
+			} else if (which >= 1 && which <= 4 && (rnd() & 1)) {
+				/* the VEX.128 form: c4 RXB.00011 W.1111.0.01 op modrm imm */
+				vex = 1;
+				e.b[n++] = 0xc4;
+				e.b[n++] = 0x03 | (xr < 8 ? 0x80 : 0) | 0x40 | (usemem || xm < 8 ? 0x20 : 0);
+				e.b[n++] = ((which <= 2 ? w : 0) << 7) | 0x79;
+				e.b[n++] = 0x60 + which - 1;
+				e.b[n++] = (usemem ? 0x00 : 0xc0) | ((xr & 7) << 3) | (usemem ? 3 : (xm & 7));
+				e.b[n++] = rnd();
+				r.gpr[3] = (u64)data + rnd() % 8;
 			} else {
 				if (which == 1 || which == 2)
 					usemem = usemem && 1;
@@ -790,7 +802,7 @@ static void test_special(int iters)
 			}
 			e.len = n;
 			/* blendv (which >= 6) is SSE4.1: copied as is on SSE4.1 hosts; it reads xmm0 */
-			fails += run_one(names[which], &e, &r, dinit, rinit, 0,
+			fails += run_one(vex ? vnames[which] : names[which], &e, &r, dinit, rinit, 0,
 					 which >= 6 && !getenv("FA_NOSSE41") ?
 					 1u | (1u << xr) | (usemem ? 0 : 1u << xm) : 0xffff);
 		}
