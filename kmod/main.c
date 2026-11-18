@@ -36,16 +36,15 @@
 #include <linux/uprobes.h>
 #include <linux/namei.h>
 #include <linux/fs.h>
-#include <asm/cpuid/api.h>
 #include <linux/elf.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/file.h>
 #include <asm/trapnr.h>
-#include <asm/msr.h>
 #include <asm/cpufeature.h>
 #include <asm/processor-flags.h>
 
+#include "compat.h"
 #include "../core/fakeavx.h"
 #include "../helpers/blob.h"
 
@@ -159,7 +158,7 @@ static unsigned long fa_gs_read(void)
 
 	if (!boot_cpu_has(X86_FEATURE_FSGSBASE))
 		return current->thread.gsbase;
-	rdmsrq(MSR_KERNEL_GS_BASE, v);
+	fa_rdmsrq(MSR_KERNEL_GS_BASE, v);
 	return v;
 }
 
@@ -167,7 +166,7 @@ static void fa_gs_write(unsigned long v)
 {
 	preempt_disable();
 	current->thread.gsbase = v;
-	wrmsrq(MSR_KERNEL_GS_BASE, v);
+	fa_wrmsrq(MSR_KERNEL_GS_BASE, v);
 	preempt_enable();
 }
 
@@ -1461,7 +1460,7 @@ static unsigned long stat_cpuid, stat_scans;
 module_param(stat_cpuid, ulong, 0444);
 module_param(stat_scans, ulong, 0444);
 
-static int fa_cpuid_handler(struct uprobe_consumer *uc, struct pt_regs *regs, __u64 *data)
+static int fa_cpuid_handler(struct uprobe_consumer *uc, struct pt_regs *regs FA_UPROBE_DATA_ARG)
 {
 	struct fa_site *st = container_of(uc, struct fa_site, uc);
 	u32 leaf = regs->ax, sub = regs->cx, a, b, c, d, max;
@@ -1531,9 +1530,36 @@ static struct fa_file *fa_file_get(struct inode *inode, const char *path)
 }
 
 /* fa_sites_lock held */
+/* uprobe (un)registration, in both API generations (compat.h) */
+static int fa_site_register(struct fa_site *st)
+{
+#ifdef FA_UPROBE_HANDLE
+	st->up = uprobe_register(st->ff->inode, st->off, 0, &st->uc);
+	return IS_ERR(st->up) ? PTR_ERR(st->up) : 0;
+#else
+	return uprobe_register(st->ff->inode, st->off, &st->uc);
+#endif
+}
+
+/* every site in fa_sites; returns once no handler can run any more */
+static void fa_sites_unregister(void)
+{
+	struct fa_site *st;
+
+#ifdef FA_UPROBE_HANDLE
+	list_for_each_entry(st, &fa_sites, list)
+		uprobe_unregister_nosync(st->up, &st->uc);
+	uprobe_unregister_sync();
+#else
+	list_for_each_entry(st, &fa_sites, list)
+		uprobe_unregister(st->ff->inode, st->off, &st->uc);	/* synchronous */
+#endif
+}
+
 static int fa_site_add(struct fa_file *ff, loff_t off)
 {
 	struct fa_site *st;
+	int ret;
 
 	list_for_each_entry(st, &fa_sites, list)
 		if (st->ff == ff && st->off == off)
@@ -1546,10 +1572,8 @@ static int fa_site_add(struct fa_file *ff, loff_t off)
 	st->ff = ff;
 	st->off = off;
 	st->uc.handler = fa_cpuid_handler;
-	st->up = uprobe_register(ff->inode, off, 0, &st->uc);
-	if (IS_ERR(st->up)) {
-		int ret = PTR_ERR(st->up);
-
+	ret = fa_site_register(st);
+	if (ret) {
 		kfree(st);
 		return ret;
 	}
@@ -1564,9 +1588,7 @@ static void fa_sites_clear(void)
 	struct fa_file *ff, *ftmp;
 
 	mutex_lock(&fa_sites_lock);
-	list_for_each_entry(st, &fa_sites, list)
-		uprobe_unregister_nosync(st->up, &st->uc);
-	uprobe_unregister_sync();
+	fa_sites_unregister();
 	list_for_each_entry_safe(st, tmp, &fa_sites, list) {
 		list_del(&st->list);
 		kfree(st);

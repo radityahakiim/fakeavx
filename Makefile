@@ -10,6 +10,8 @@
 #   make check          core tests; needs a machine with real AVX2
 #   make selftest       build and run every test this machine can run, write a
 #                       report to reports/ (tests/selftest.sh; QUICK=1 for ~5 min)
+#   make kernel-compat  compile the module against kernels 6.1 ... 7.4 from
+#                       kernel.org (tests/kernel-compat.sh; downloads ~1 GB)
 #   make vmtest         end-to-end test in QEMU; needs KERNEL=bzImage built
 #                       from the tree the module was built against (KDIR)
 #   make clean
@@ -52,6 +54,9 @@ check: helpers
 selftest:
 	tests/selftest.sh $(if $(QUICK),--quick)
 
+kernel-compat:
+	tests/kernel-compat.sh
+
 vmtest: module guest
 	tests/qemu/run.sh
 
@@ -63,4 +68,4 @@ clean:
 	$(MAKE) -C tools/prof clean
 
 help:
-	@sed -n '3,15p' Makefile | sed 's/^# \{0,1\}//'
+	@sed -n '3,17p' Makefile | sed 's/^# \{0,1\}//'

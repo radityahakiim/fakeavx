@@ -55,6 +55,14 @@ Arch), gcc, make, binutils; `dkms` recommended. The kernel needs
 `CONFIG_KPROBES`, `CONFIG_MMU_NOTIFIER` and `CONFIG_UPROBES` (all set in Arch
 kernels).
 
+Kernel versions: the module builds on Linux 6.1 to 7.4. `kmod/compat.h`
+holds the API differences (the CPUID header, the MSR accessor names, the
+uprobe registration and handler signatures), and
+`tests/kernel-compat.sh` (`make kernel-compat`) compile-tests against
+kernel.org sources of 6.1, 6.6, 6.12, 6.18, 7.2, 7.3 and 7.4-rc3 by default
+(any versions can be given). Compiling is what that checks; the module has
+been run on 6.18.
+
 ```sh
 make                # helper blob + kernel module
 sudo make install   # permanent: loaded at every boot
