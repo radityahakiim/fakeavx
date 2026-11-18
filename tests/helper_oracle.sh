@@ -24,18 +24,21 @@ make -s -C "$work/helpers"
 	$(ls ../core/*.c))
 rc=0
 # dump: each instruction translated alone; rdump: the loops of hb_loops,
-# each built as a region (borrowed registers, exits) and run 1-50 times
-for what in dump rdump; do
+# each built as a region (borrowed registers, exits) and run 1-50 times;
+# sdump: pcmpXstrX with every control byte, operand form and W (3072
+# combinations x 40 inputs)
+for what in dump rdump sdump; do
+	if [ $what = sdump ]; then k=40; else k=$n; fi
 	for mode in penryn ssse3; do
 		if [ $mode = ssse3 ]; then e="HB_NOSSE41=1"; else e="HB_PENRYN=1"; fi
 		tests=$(env $e "$top/tests/helperbench" $what "" 1 | wc -l)
-		if cmp -s <(env $e "$work/tests/helperbench" $what "" "$n") \
-			  <(env $e "$top/tests/helperbench" $what "" "$n") 2>/dev/null; then
-			echo "$what, $mode host: identical to $ref ($tests x $n inputs)"
+		if cmp -s <(env $e "$work/tests/helperbench" $what "" "$k") \
+			  <(env $e "$top/tests/helperbench" $what "" "$k") 2>/dev/null; then
+			echo "$what, $mode host: identical to $ref ($tests x $k inputs)"
 		else
 			echo "$what, $mode host: DIFFERENT from $ref"
-			diff <(env $e "$work/tests/helperbench" $what "" "$n") \
-			     <(env $e "$top/tests/helperbench" $what "" "$n") |
+			diff <(env $e "$work/tests/helperbench" $what "" "$k") \
+			     <(env $e "$top/tests/helperbench" $what "" "$k") |
 				grep '^[<>]' | cut -d' ' -f1-3 | head -10
 			rc=1
 		fi

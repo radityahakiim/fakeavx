@@ -281,17 +281,36 @@ static void do_pcmpgtq_legacy(const struct fa_insn *in, u64 *gpr, u8 *st)
 	memcpy(st + FA_ST_LO + 16 * in->reg, a.b, 16);
 }
 
-static int str_elem(const vec *v, int i, int fmt)
+/*
+ * The 16 bytes of an operand as 16 bytes or 8 words, signed or not (imm[1:0]),
+ * each element widened to an int once: the comparisons below then need no
+ * per-element decoding (formerly a switch per element, up to 512 times).
+ */
+static int str_elems(const u8 *p, int fmt, s32 *e)
 {
+	int i;
+
 	switch (fmt) {
-	case 0: return v->b[i];
-	case 1: return v->b[2 * i] | (v->b[2 * i + 1] << 8);
-	case 2: return (s8)v->b[i];
-	default: return (s16)(v->b[2 * i] | (v->b[2 * i + 1] << 8));
+	case 0:
+		for (i = 0; i < 16; i++)
+			e[i] = p[i];
+		return 16;
+	case 1:
+		for (i = 0; i < 8; i++)
+			e[i] = p[2 * i] | p[2 * i + 1] << 8;
+		return 8;
+	case 2:
+		for (i = 0; i < 16; i++)
+			e[i] = (s8)p[i];
+		return 16;
+	default:
+		for (i = 0; i < 8; i++)
+			e[i] = (s16)(p[2 * i] | p[2 * i + 1] << 8);
+		return 8;
 	}
 }
 
-static int str_len(const struct fa_insn *in, u64 reg, const vec *v, int fmt, int n)
+static int str_len(const struct fa_insn *in, u64 reg, const s32 *e, int n)
 {
 	int i;
 
@@ -302,57 +321,149 @@ static int str_len(const struct fa_insn *in, u64 reg, const vec *v, int fmt, int
 			l = -l;
 		return (l < 0 || l > n) ? n : (int)l;
 	}
-	for (i = 0; i < n; i++)
-		if (!str_elem(v, i, fmt))
-			break;
+	for (i = 0; i < n && e[i]; i++)	/* implicit: up to the first zero element */
+		;
 	return i;
+}
+
+/* index of the first zero byte in 16 bytes, or 16 */
+static inline int zero_byte(const u8 *p)
+{
+	u64 w[2];
+	int k;
+
+	memcpy(w, p, 16);
+	for (k = 0; k < 2; k++) {
+		u64 z = (w[k] - 0x0101010101010101ULL) & ~w[k] & 0x8080808080808080ULL;
+
+		if (z)	/* the lowest set bit marks the first zero byte exactly */
+			return 8 * k + __builtin_ctzll(z) / 8;
+	}
+	return 16;
+}
+
+/*
+ * IntRes1 for byte elements and equal any / ranges, straight from the bytes:
+ * the set of matching values as a 256-bit map (signed bytes ^ 0x80, which
+ * keeps their order), then 16 independent lookups. A range sets its bits in
+ * at most four words, whatever its width.
+ */
+static u32 pcmpstr_bytes(const struct fa_insn *in, const u64 *gpr, const u8 *pa, const u8 *pb,
+			 int fmt, int agg, int *pla, int *plb)
+{
+	u64 map[4] = { 0, 0, 0, 0 };
+	u8 flip = fmt == 2 ? 0x80 : 0;
+	u32 res = 0;
+	int la, lb, i, j;
+
+	if (in->opcode <= 0x61) {	/* explicit lengths, as str_len() */
+		s64 l1 = in->W ? (s64)gpr[0] : (s64)(s32)gpr[0];
+		s64 l2 = in->W ? (s64)gpr[2] : (s64)(s32)gpr[2];
+
+		if (l1 < 0)
+			l1 = -l1;
+		if (l2 < 0)
+			l2 = -l2;
+		la = (l1 < 0 || l1 > 16) ? 16 : (int)l1;
+		lb = (l2 < 0 || l2 > 16) ? 16 : (int)l2;
+	} else {
+		la = zero_byte(pa);
+		lb = zero_byte(pb);
+	}
+	if (agg == 0) {
+		for (i = 0; i < la; i++) {
+			u8 v = pa[i] ^ flip;
+
+			map[v >> 6] |= 1ULL << (v & 63);
+		}
+	} else {
+		for (i = 0; i + 1 < la; i += 2) {
+			int lo = pa[i] ^ flip, hi = pa[i + 1] ^ flip, w;
+
+			if (lo > hi)
+				continue;		/* matches nothing */
+			for (w = lo >> 6; w <= hi >> 6; w++) {
+				int l = w == lo >> 6 ? lo & 63 : 0, h = w == hi >> 6 ? hi & 63 : 63;
+
+				map[w] |= (~0ULL >> (63 - h)) & (~0ULL << l);	/* bits l..h */
+			}
+		}
+	}
+#pragma GCC unroll 16
+	for (j = 0; j < 16; j++) {
+		u8 v = pb[j] ^ flip;
+
+		res |= (u32)(map[v >> 6] >> (v & 63) & 1) << j;
+	}
+	*pla = la;
+	*plb = lb;
+	return lb >= 16 ? res : res & ((1u << lb) - 1);	/* only j < lb can match */
 }
 
 static void do_pcmpstr(const struct fa_insn *in, u64 *gpr, u64 *flags, u8 *st)
 {
-	int fmt = in->imm & 3, n = (fmt & 1) ? 8 : 16;
+	int fmt = in->imm & 3, n;
 	int agg = (in->imm >> 2) & 3, pol = (in->imm >> 4) & 3;
-	u32 res = 0, all = (1u << n) - 1;
+	u32 res = 0, all;
 	int la, lb, i, j;
-	vec a, b;
+	u8 pa[16], pb[16];
+	s32 a[16], b[16];
 
-	get_reg(st, in->reg, &a);
-	get_rm(in, gpr, st, &b, 16);
-	la = str_len(in, gpr[0], &a, fmt, n);
-	lb = str_len(in, gpr[2], &b, fmt, n);
+	memcpy(pa, st + FA_ST_LO + 16 * in->reg, 16);
+	if (in->mod == 3)
+		memcpy(pb, st + FA_ST_LO + 16 * in->rm, 16);
+	else
+		memcpy(pb, ea(in, gpr, 0, 0), 16);
+	if (!(fmt & 1) && agg <= 1) {
+		/* bytes, equal any / ranges (what picohttpparser and most uses are) */
+		res = pcmpstr_bytes(in, gpr, pa, pb, fmt, agg, &la, &lb);
+		n = 16;
+		all = 0xffff;
+		goto out;
+	}
+	n = str_elems(pa, fmt, a);
+	str_elems(pb, fmt, b);
+	all = (1u << n) - 1;
+	la = str_len(in, gpr[0], a, n);
+	lb = str_len(in, gpr[2], b, n);
 
-	for (j = 0; j < n; j++) {
-		int bj = str_elem(&b, j, fmt), bit = 0;
+	/* IntRes1: bit j for element j of the second operand (only j < lb can be set
+	 * by any and ranges) */
+	switch (agg) {
+	case 0:		/* equal any: b[j] is one of a[0..la) */
+		for (i = 0; i < la; i++)
+			for (j = 0; j < lb; j++)
+				res |= (u32)(a[i] == b[j]) << j;
+		break;
+	case 1:		/* ranges: a[i] <= b[j] <= a[i+1] for a pair i */
+		for (i = 0; i + 1 < la; i += 2) {
+			s32 lo = a[i], hi = a[i + 1];
 
-		switch (agg) {
-		case 0:		/* equal any */
-			for (i = 0; i < la && j < lb; i++)
-				bit |= str_elem(&a, i, fmt) == bj;
-			break;
-		case 1:		/* ranges */
-			for (i = 0; i + 1 < la && j < lb; i += 2)
-				bit |= bj >= str_elem(&a, i, fmt) && bj <= str_elem(&a, i + 1, fmt);
-			break;
-		case 2:		/* equal each */
-			if (j < la && j < lb)
-				bit = str_elem(&a, j, fmt) == bj;
-			else
-				bit = j >= la && j >= lb;
-			break;
-		default:	/* equal ordered */
-			bit = 1;
+			for (j = 0; j < lb; j++)
+				res |= (u32)((b[j] >= lo) & (b[j] <= hi)) << j;
+		}
+		break;
+	case 2:		/* equal each */
+		for (j = 0; j < n; j++)
+			res |= (u32)(j < la && j < lb ? a[j] == b[j] : j >= la && j >= lb) << j;
+		break;
+	default:	/* equal ordered: the needle a[0..la) starts at b[j] */
+		for (j = 0; j < n; j++) {
+			int bit = 1;
+
 			for (i = 0; i < n - j && bit; i++) {
 				if (i >= la)
 					break;			/* past the needle: matches */
 				if (j + i >= lb)
 					bit = 0;		/* haystack ran out */
 				else
-					bit = str_elem(&a, i, fmt) == str_elem(&b, j + i, fmt);
+					bit = a[i] == b[j + i];
 			}
-			break;
+			res |= (u32)bit << j;
 		}
-		res |= (u32)bit << j;
+		break;
 	}
+out:
 	if (pol == 1)
 		res ^= all;
 	else if (pol == 3)

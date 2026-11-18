@@ -10,6 +10,7 @@
  *                                many random inputs: run it from two builds and
  *                                cmp the outputs (old blob = oracle)
  *   helperbench vexpair [N]      VEX vpcmpXstrX against their legacy encodings
+ *   helperbench sdump "" [N]     pcmpXstrX, all control bytes: state dump for two builds
  *   helperbench mvexpair [N]     the same, executed under the loaded module
  *   helperbench mdump|mrdump|mrtime   the same instructions and loops run
  *                                natively, so that the loaded fakeavx module
@@ -427,6 +428,131 @@ static int mvexpair(long cases)
 	return bad != 0;
 }
 
+/*
+ * strcost: cycles per pcmpXstrX by aggregation mode, element size and
+ * string length (both operands the same length; implicit forms get a
+ * terminating zero there, explicit forms the length in eax/edx).
+ */
+static void strcost(void)
+{
+	static const char *agg[] = { "equal-any", "ranges", "equal-each", "equal-ordered" };
+	static const char *opn[] = { "pcmpestrm", "pcmpestri", "pcmpistrm", "pcmpistri" };
+	u8 *stub = code + 0x10000, *empty = code + 0xf000, ins[16];
+	struct hb_state *sp = placed_state();
+
+	empty[0] = 0xc3;
+	printf("cycles per instruction (VEX and legacy forms share the helper)\n");
+	printf("%-10s %-13s %-5s %9s %9s %9s\n", "insn", "mode", "elem", "len 3", "len half", "full");
+	for (int op = 0x60; op <= 0x63; op++)
+		for (int a = 0; a < 4; a++)
+			for (int fmt = 0; fmt < 2; fmt++) {
+				int n = fmt ? 8 : 16;
+				double c[3];
+
+				for (int L = 0; L < 3; L++) {
+					int len = L == 0 ? 3 : L == 1 ? n / 2 : n;
+					u8 b[16];
+					struct hb_ent e = { "s", ins, ins + 6 };
+
+					/* 66 0f 3a op modrm(xmm1, xmm2) imm */
+					ins[0] = 0x66; ins[1] = 0x0f; ins[2] = 0x3a; ins[3] = op; ins[4] = 0xca;
+					ins[5] = (u8)(fmt | a << 2);
+					build(&e, UNROLL, stub);
+					memset(sp, 0, sizeof(*sp));
+					for (int i = 0; i < 16; i++)
+						b[i] = 'a' + i % 7;
+					if (len < n) {		/* terminator for the implicit forms */
+						b[fmt ? 2 * len : len] = 0;
+						if (fmt)
+							b[2 * len + 1] = 0;
+					}
+					memcpy(sp->xmm[1], b, 16);
+					memcpy(sp->xmm[2], b, 16);
+					sp->gp[0] = sp->gp[2] = len;
+					sp->gp[6] = (u64)sp->mem;
+					sp->flags = 0x202;
+					sp->mxcsr = 0x1f80;
+					put_hi(sp);
+					{
+						u64 d[9], tl, tm;
+
+						hb_loop(sp, stub, 2000);
+						for (int r = 0; r < 9; r++) {
+							u64 t0 = rdtsc();
+
+							hb_loop(sp, empty, 2000);
+							tm = rdtsc();
+							hb_loop(sp, stub, 2000);
+							tl = rdtsc();
+							d[r] = (tl - tm) - (tm - t0);
+						}
+						qsort(d, 9, sizeof(d[0]), cmp_u64);
+						c[L] = (double)d[4] / (2000.0 * UNROLL);
+					}
+				}
+				printf("%-10s %-13s %-5s %9.0f %9.0f %9.0f\n", opn[op - 0x60], agg[a],
+				       fmt ? "word" : "byte", c[0], c[1], c[2]);
+			}
+}
+
+/*
+ * sdump: complete state after legacy pcmpXstrX for every instruction x
+ * control byte x register/memory operand x W, on string-like inputs (short
+ * alphabets with zeros, signed and wide values, lengths -20..20, INT_MIN,
+ * W-dependent upper halves). Compare two builds' outputs (helper_oracle.sh).
+ */
+static void sdump(long cases)
+{
+	static struct hb_state a;
+	u8 *stub = code + 0x10000, ins[16];
+
+	for (int op = 0x60; op <= 0x63; op++)
+		for (int mem = 0; mem < 2; mem++)
+			for (int w = 0; w < (op <= 0x61 ? 2 : 1); w++)
+				for (int imm = 0; imm < 256; imm++) {
+					struct hb_ent e = { "s", ins, 0 };
+					int k = 0;
+
+					ins[k++] = 0x66;
+					if (w)
+						ins[k++] = 0x48;
+					ins[k++] = 0x0f; ins[k++] = 0x3a; ins[k++] = op; ins[k++] = mem ? 0x4e : 0xca;
+					if (mem)
+						ins[k++] = 0x10;
+					ins[k++] = imm;
+					e.end = ins + k;
+					build(&e, 1, stub);
+					for (long c = 0; c < cases; c++) {
+						int alpha = c % 4 == 0 ? 256 : c % 4 == 1 ? 5 : c % 4 == 2 ? 3 : 130;
+						char name[48];
+
+						fill(&a, "sdump", c * 1000 + imm);
+						for (int i = 0; i < 16; i++) {
+							/* alphabet 130: values around 0x7f/0x80, signed edges */
+							int v1 = rnd() % alpha, v2 = rnd() % alpha, v3 = rnd() % alpha;
+
+							a.xmm[1][i] = alpha == 130 ? 0x7f + v1 % 3 - (v1 & 0x80) : v1;
+							a.xmm[2][i] = alpha == 130 ? 0x7f + v2 % 3 - (v2 & 0x80) : v2;
+							a.mem[16 + i] = alpha == 130 ? 0x7f + v3 % 3 - (v3 & 0x80) : v3;
+						}
+						if (c % 7 == 3)		/* no terminator at all */
+							for (int i = 0; i < 16; i++)
+								a.xmm[1][i] |= 1, a.xmm[2][i] |= 1, a.mem[16 + i] |= 1;
+						a.gp[0] = (u64)(s64)((int)(rnd() % 41) - 20);
+						a.gp[2] = (u64)(s64)((int)(rnd() % 41) - 20);
+						if (c % 16 == 5)
+							a.gp[0] = 0x80000000u;
+						if (c % 16 == 9)
+							a.gp[2] = 0xffffffff00000003ull;
+						put_hi(&a);
+						hb_once(&a, stub);
+						get_hi(&a);
+						snprintf(name, sizeof(name), "op%x/m%d/w%d/imm%02x", op, mem, w, imm);
+						print_state(name, c, &a);
+					}
+				}
+}
+
 static void dump(const char *filter, long cases)
 {
 	static struct hb_state s;
@@ -703,6 +829,54 @@ int main(int argc, char **argv)
 	CPU_SET(sched_getcpu(), &set);
 	sched_setaffinity(0, sizeof(set), &set);
 	setvbuf(stdout, NULL, getenv("HB_UNBUF") ? _IONBF : _IOFBF, 1 << 20);
+	if (!strcmp(mode, "sdump")) {
+		sdump(argc > 3 ? atol(argv[3]) : 40);	/* sdump "" N, like the other modes */
+		return 0;
+	}
+	if (!strcmp(mode, "strcost")) {
+		strcost();
+		return 0;
+	}
+	if (!strcmp(mode, "strhttp")) {	/* picohttpparser's form: pcmpestri $4/$0x14, la = range bytes, lb = 16 */
+		u8 *stub = code + 0x10000, *empty = code + 0xf000, ins[8];
+		struct hb_state *sp = placed_state();
+		const char *req = "Host: example.com\r\nUser-Agent: bench/1.0\r\nAccept: */*\r\n";
+
+		empty[0] = 0xc3;
+		printf("%-6s %4s %s\n", "imm", "la", "cycles (lb = 16, HTTP header text)");
+		for (int imm = 0x04; imm <= 0x14; imm += 0x10)
+			for (int la = 2; la <= 16; la += la < 8 ? 2 : 8) {
+				struct hb_ent e = { "h", ins, ins + 6 };
+				u64 d[9];
+
+				ins[0] = 0x66; ins[1] = 0x0f; ins[2] = 0x3a; ins[3] = 0x61; ins[4] = 0xca; ins[5] = imm;
+				build(&e, UNROLL, stub);
+				memset(sp, 0, sizeof(*sp));
+				memcpy(sp->xmm[0], "\x00 \x7f\x7f\"\"\x3a\x3a\r\r\n\n,,;;", 16);	/* ranges */
+				memcpy(sp->xmm[2], req, 16);
+				sp->gp[0] = la;
+				sp->gp[2] = 16;
+				sp->gp[6] = (u64)sp->mem;
+				sp->flags = 0x202;
+				sp->mxcsr = 0x1f80;
+				/* the instruction above names xmm1 as the ranges: copy them there */
+				memcpy(sp->xmm[1], sp->xmm[0], 16);
+				put_hi(sp);
+				hb_loop(sp, stub, 2000);
+				for (int r = 0; r < 9; r++) {
+					u64 t0 = rdtsc(), tm, tl;
+
+					hb_loop(sp, empty, 2000);
+					tm = rdtsc();
+					hb_loop(sp, stub, 2000);
+					tl = rdtsc();
+					d[r] = (tl - tm) - (tm - t0);
+				}
+				qsort(d, 9, sizeof(d[0]), cmp_u64);
+				printf("%#-6x %4d %8.0f\n", imm, la, (double)d[4] / (2000.0 * UNROLL));
+			}
+		return 0;
+	}
 	if (!strcmp(mode, "vexpair"))
 		return vexpair(argc > 2 ? atol(argv[2]) : 50);
 	if (!strcmp(mode, "dump"))
