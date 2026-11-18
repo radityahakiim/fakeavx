@@ -79,7 +79,7 @@ MODULE_PARM_DESC(force, "load even if the CPU already supports AVX (for testing 
 
 static unsigned long stat_fast, stat_slow, stat_translated, stat_patched, stat_patched_short,
 	stat_patched_int, stat_regions, stat_regions_borrowing, stat_unsupported,
-	stat_short_refused, stat_unpatched, stat_diverted;
+	stat_short_refused, stat_unpatched, stat_diverted, stat_evicted, stat_evict_traps;
 module_param(stat_fast, ulong, 0444);
 module_param(stat_slow, ulong, 0444);
 module_param(stat_translated, ulong, 0444);
@@ -92,6 +92,13 @@ module_param(stat_unsupported, ulong, 0444);
 module_param(stat_short_refused, ulong, 0444);
 module_param(stat_unpatched, ulong, 0444);
 module_param(stat_diverted, ulong, 0444);
+module_param(stat_evicted, ulong, 0444);
+module_param(stat_evict_traps, ulong, 0444);
+
+static bool evict = true;
+module_param(evict, bool, 0644);
+MODULE_PARM_DESC(evict, "patch short instructions by rewriting the first byte(s) of the next one "
+		 "when their own jump window is unusable (default on)");
 
 /* One translated guest instruction. stub == 0: known to be unsupported. */
 struct fa_tr {
@@ -99,6 +106,7 @@ struct fa_tr {
 	u8 len;
 	u8 bytes[15];		/* what guest memory holds at this address */
 	u8 dv_tried;		/* fa_divert() has been tried */
+	u8 evicted;		/* first byte(s) rewritten by eviction: see fa_ev_window() */
 	u32 unp;		/* its entry in /proc/fakeavx/unpatched, if any */
 	atomic_long_t hits;	/* traps since then */
 	struct rcu_head rcu;
@@ -662,13 +670,14 @@ static struct fa_region *fa_region_get(struct fa_mm *fm, unsigned long ip)
  * instruction) window.
  */
 static struct fa_region *fa_window_get(struct fa_mm *fm, unsigned long lo,
-				       unsigned long hi, unsigned long *addr, int *why)
+				       unsigned long hi, unsigned long size,
+				       unsigned long *addr, int *why)
 {
 	struct fa_region *r;
 	int k, w = FW_RANGE;
 
 	list_for_each_entry(r, &fm->regions, list) {
-		*addr = fa_alloc_in(r, lo, hi, FA_ENTRY_MAX);
+		*addr = fa_alloc_in(r, lo, hi, size);
 		if (*addr)
 			return r;
 	}
@@ -692,7 +701,7 @@ static struct fa_region *fa_window_get(struct fa_mm *fm, unsigned long lo,
 		return NULL;
 	}
 got:
-	*addr = fa_alloc_in(r, lo, hi, FA_ENTRY_MAX);
+	*addr = fa_alloc_in(r, lo, hi, size);
 	if (!*addr)
 		*why = FW_BUSY;
 	return *addr ? r : NULL;
@@ -722,6 +731,35 @@ static bool fa_patchable(struct fa_mm *fm, unsigned long ip, int len)
 	return ok;
 }
 
+/* Is addr in one of our code cache regions (anonymous, executable, not writable)? */
+static bool fa_in_cache(struct fa_mm *fm, unsigned long addr)
+{
+	struct vm_area_struct *vma;
+	bool ret;
+
+	mmap_read_lock(fm->mm);
+	vma = vma_lookup(fm->mm, addr);
+	ret = vma && !vma->vm_file && (vma->vm_flags & (VM_EXEC | VM_WRITE)) == VM_EXEC;
+	mmap_read_unlock(fm->mm);
+	return ret;
+}
+
+/*
+ * The target of a short patch j (3 or 4) bytes before ip that would borrow
+ * ip's first bytes, or 0 if there is none. b: the 8 bytes from ip - 4.
+ */
+static unsigned long fa_short_target(struct fa_mm *fm, unsigned long ip, const u8 *b, int j)
+{
+	unsigned long t;
+	s32 rel;
+
+	if (b[4 - j] != 0xe9)
+		return 0;
+	memcpy(&rel, b + 5 - j, 4);
+	t = ip - j + 5 + (long)rel;
+	return fa_in_cache(fm, t) ? t : 0;
+}
+
 /*
  * Does a short patch just before ip borrow the first bytes of the instruction
  * at ip as part of its jump displacement? Such a patch is a jump located 3
@@ -731,26 +769,11 @@ static bool fa_patchable(struct fa_mm *fm, unsigned long ip, int len)
  */
 static bool fa_borrowed(struct fa_mm *fm, unsigned long ip)
 {
-	bool ret = false;
 	u8 b[8];
-	int j;
 
 	if (copy_from_user(b, (void __user *)(ip - 4), 8))
 		return true;
-	mmap_read_lock(fm->mm);
-	for (j = 3; j <= 4 && !ret; j++) {
-		struct vm_area_struct *vma;
-		s32 rel;
-
-		if (b[4 - j] != 0xe9)
-			continue;
-		memcpy(&rel, b + 5 - j, 4);
-		vma = vma_lookup(fm->mm, ip - j + 5 + (long)rel);
-		ret = vma && !vma->vm_file &&
-		      (vma->vm_flags & (VM_EXEC | VM_WRITE)) == VM_EXEC;
-	}
-	mmap_read_unlock(fm->mm);
-	return ret;
+	return fa_short_target(fm, ip, b, 3) || fa_short_target(fm, ip, b, 4);
 }
 
 /*
@@ -807,6 +830,148 @@ static int fa_patch_site(struct fa_mm *fm, struct fa_tr *tr, unsigned long ip,
 	if (tr->len < 5)
 		stat_patched_short++;
 	return FW_OK;
+}
+
+/*
+ * Eviction. A 3- or 4-byte instruction's jump takes its top displacement
+ * byte(s) from the instruction after it. When those bytes put the stub
+ * window where nothing can be mapped - a VEX prefix (0xc4/0xc5), or any byte
+ * of 0x80 or more, means 1-2 GB below the instruction, which in a non-PIE
+ * program (text at a few MB) is below address 0 - and that next instruction
+ * is itself one of ours in the same region, its first byte(s) are rewritten
+ * instead: byte 0 becomes an opcode that is invalid in 64-bit mode, chosen
+ * so that the window lies somewhere usable (for a 3-byte instruction, byte 1
+ * is free as well).
+ *
+ * The region runs the next instruction from its translation, so the
+ * rewritten bytes only execute when something jumps straight to it. That
+ * raises #UD, and its record (bytes updated like a patch's) sends it to its
+ * entry, just as for an inner instruction that was not patched. Its own
+ * patch, if it had one, is lost; stat_evict_traps counts such entries.
+ *
+ * After fork() the child has the memory but not the records. So the stub
+ * carries a struct fa_ev_rec at FA_EV_OFF, which fa_evicted_find() reaches
+ * through the jump that borrows the rewritten bytes.
+ */
+#define FA_EV_MAGIC	0x76456146	/* "FaEv" */
+#define FA_EV_OFF	ALIGN(FA_ENTRY_MAX, 16)
+
+struct fa_ev_rec {
+	u32 magic;
+	u8 len;			/* the rewritten instruction's length */
+	u8 pad[3];
+	u64 ip;			/* its address */
+	u64 entry;		/* where it is translated */
+};
+
+#define FA_EV_SIZE	(FA_EV_OFF + sizeof(struct fa_ev_rec))
+
+/* 64-bit mode #UD opcodes that are not prefixes (0x62 left out: EVEX) */
+static const u8 fa_ud_op[] = {
+	0x06, 0x07, 0x0e, 0x16, 0x17, 0x1e, 0x1f, 0x27, 0x2f, 0x37, 0x3f, 0x60, 0x61,
+};
+
+/* Can h be the displacement's top byte (len 4) or top two bytes (len 3)? */
+static bool fa_ev_ok(unsigned int h, int len)
+{
+	int i;
+
+	if (len == 3 && h >= 0x8000)
+		return false;	/* byte 1, the top byte, must stay positive */
+	for (i = 0; i < ARRAY_SIZE(fa_ud_op); i++)
+		if ((h & 0xff) == fa_ud_op[i])
+			return len == 3 || h < 0x100;
+	return false;
+}
+
+/*
+ * A stub address for the short instruction at ip (length len) with the
+ * displacement's top bits h chosen by fa_ev_ok(); nb receives the bytes for
+ * the next instruction. Existing regions are tried first.
+ */
+static struct fa_region *fa_ev_window(struct fa_mm *fm, unsigned long ip, int len,
+				      unsigned long *addr, u8 *nb)
+{
+	const int shift = 8 * (len - 1);
+	const unsigned long base = ip + 5, hmax = len == 4 ? 0xff : 0xffff;
+	unsigned long h, want;
+	struct fa_region *r;
+	int tries = 0, why;
+
+	list_for_each_entry(r, &fm->regions, list) {
+		unsigned long a0 = max(ALIGN(r->start + r->used, 16), base), a1 = r->start + r->size;
+
+		if (a0 + FA_EV_SIZE > a1)
+			continue;
+		for (h = (a0 - base) >> shift; h <= hmax && h <= (a1 - FA_EV_SIZE - base) >> shift;
+		     h++) {
+			if (!fa_ev_ok(h, len))
+				continue;
+			*addr = fa_alloc_in(r, base + (h << shift), base + ((h + 1) << shift),
+					    FA_EV_SIZE);
+			if (*addr)
+				goto got;
+		}
+	}
+	/* a new mapping: start above the heap, where the windows can be */
+	want = max(fm->mm->brk, ip) + FA_HEAP_GAP_WINDOW;
+	for (h = want > base ? (want - base) >> shift : 0; h <= hmax && tries < 32; h++) {
+		if (!fa_ev_ok(h, len))
+			continue;
+		tries++;
+		r = fa_window_get(fm, base + (h << shift), base + ((h + 1) << shift), FA_EV_SIZE,
+				  addr, &why);
+		if (r)
+			goto got;
+	}
+	return NULL;
+got:
+	nb[0] = h & 0xff;
+	nb[1] = h >> 8;		/* used for len 3 only */
+	return r;
+}
+
+/* Write the next instruction's new first byte(s); byte 0 first, so it traps from then on. */
+static int fa_ev_poke(struct fa_tr *ntr, unsigned long nip, const u8 *nb, int nf)
+{
+	int k;
+
+	for (k = 0; k < nf; k++) {
+		if (fa_poke(nip + k, nb + k, 1))
+			return FW_POKE;
+		ntr->bytes[k] = nb[k];
+		on_each_cpu(fa_nop, NULL, 1);
+	}
+	return FW_OK;
+}
+
+static struct fa_tr *fa_tr_store(struct fa_mm *fm, unsigned long ip, u64 stub,
+				 const u8 *bytes, int len);
+
+/* Find the record of an instruction rewritten by eviction, in a process that lacks it (fork). */
+static struct fa_tr *fa_evicted_find(struct fa_mm *fm, unsigned long ip, const u8 *buf, int n)
+{
+	struct fa_ev_rec rec;
+	struct fa_tr *tr;
+	u8 b[8];
+	int j;
+
+	if (copy_from_user(b, (void __user *)(ip - 4), 8))
+		return NULL;
+	for (j = 4; j >= 3; j--) {
+		unsigned long stub = fa_short_target(fm, ip, b, j);
+
+		if (!stub || copy_from_user(&rec, (void __user *)(stub + FA_EV_OFF), sizeof(rec)))
+			continue;
+		if (rec.magic != FA_EV_MAGIC || rec.ip != ip || rec.len < 5 - j || rec.len > n ||
+		    rec.len > 15 || !fa_in_cache(fm, rec.entry))
+			continue;
+		tr = fa_tr_store(fm, ip, rec.entry, buf, rec.len);
+		if (tr)
+			tr->evicted = 1;
+		return tr;
+	}
+	return NULL;
 }
 
 /*
@@ -1002,6 +1167,35 @@ static int fa_rd(void *ctx, u64 addr, u8 *buf, int n)
 }
 
 /*
+ * May the instruction after it (short, its jump window unusable) be evicted
+ * (see fa_ev_window())? It must follow it in the same block of the region,
+ * be translated with an entry, and its first bytes must still be what its
+ * record says and borrowed by nothing. cur: the 5 bytes from it->ip.
+ */
+static struct fa_tr *fa_ev_next(struct fa_mm *fm, const struct fa_rgn *rg,
+				const struct fa_ritem *it, const u8 *cur)
+{
+	const struct fa_ritem *nx = it + 1;
+	int nf = 5 - it->len;
+	struct fa_tr *ntr, *nt2;
+
+	if (nx >= rg->it + rg->n || it->has_link || nx->ip != it->ip + it->len ||
+	    nx->kind != FA_R_OURS)
+		return NULL;
+	ntr = xa_load(&fm->tr, nx->ip);
+	if (!ntr || !ntr->stub || ntr->evicted || ntr->len < nf ||
+	    memcmp(ntr->bytes, cur + it->len, nf))
+		return NULL;
+	if (fa_borrowed(fm, nx->ip) || !fa_patchable(fm, nx->ip, ntr->len))
+		return NULL;
+	/* its own jump may be what leads a forked child to the next eviction record */
+	nt2 = xa_load(&fm->tr, nx->ip + ntr->len);
+	if (nt2 && nt2->evicted)
+		return NULL;
+	return ntr;
+}
+
+/*
  * Give one guest instruction of a freshly built region its way in: an entry
  * stub (borrow registers, jump to the instruction's place in the body), a
  * translation record, and if possible a jump patched over the instruction.
@@ -1015,9 +1209,9 @@ static struct fa_tr *fa_make_entry(struct fa_mm *fm, struct fa_region *main,
 	bool want_patch = may_patch && patch && it->nread >= 5 && it->len >= 3 &&
 			  fa_patchable(fm, ip, it->len);
 	struct fa_region *r = NULL;
-	u8 stub[FA_ENTRY_MAX], cur[5];
-	struct fa_tr *tr;
-	int n, why = FW_OK;
+	u8 stub[FA_ENTRY_MAX], cur[5], nb[2], old[2];
+	struct fa_tr *tr, *ntr = NULL;	/* ntr: the next instruction, if evicted */
+	int n, why = FW_OK, nf = 5 - it->len;
 	u32 unp = 0;
 
 	/* what follows may have been patched since the region was read */
@@ -1032,7 +1226,14 @@ static struct fa_tr *fa_make_entry(struct fa_mm *fm, struct fa_region *main,
 
 		memcpy(&fixed, cur + it->len, 5 - it->len);
 		lo = ip + 5 + (long)(s32)(fixed << shift);
-		r = fa_window_get(fm, lo, lo + (1UL << shift), &addr, &why);
+		r = fa_window_get(fm, lo, lo + (1UL << shift), FA_ENTRY_MAX, &addr, &why);
+		if (!r && evict && it->kind == FA_R_OURS) {
+			ntr = fa_ev_next(fm, rg, it, cur);
+			if (ntr)
+				r = fa_ev_window(fm, ip, it->len, &addr, nb);
+			if (!r)
+				ntr = NULL;
+		}
 		if (!r && it->kind == FA_R_OURS) {
 			stat_short_refused++;	/* will trap on every execution */
 			unp = fa_report_unpatched(fm, ip, it->bytes, it->len, why, lo,
@@ -1054,10 +1255,40 @@ static struct fa_tr *fa_make_entry(struct fa_mm *fm, struct fa_region *main,
 		if (fa_poke(addr, stub, n))
 			return NULL;
 		r->used = addr + ALIGN(n, 16) - r->start;
+		if (ntr) {
+			struct fa_ev_rec rec = {
+				.magic = FA_EV_MAGIC, .len = ntr->len,
+				.ip = ip + it->len, .entry = ntr->stub,
+			};
+
+			if (fa_poke(addr + FA_EV_OFF, &rec, sizeof(rec)))
+				return NULL;
+			r->used = addr + ALIGN(FA_EV_SIZE, 16) - r->start;
+		}
 	}
 	tr = fa_tr_store(fm, ip, addr, it->bytes, it->len);
 	if (!tr)
 		return NULL;
+	if (want_patch && ntr) {
+		memcpy(old, ntr->bytes, nf);
+		why = fa_ev_poke(ntr, ip + it->len, nb, nf);
+		memcpy(cur + it->len, ntr->bytes, nf);
+		if (!why)
+			why = fa_patch_site(fm, tr, ip, cur);
+		if (why) {
+			/* put the next instruction back: last byte first, byte 0 keeps it trapping */
+			while (--nf >= 0)
+				if (ntr->bytes[nf] != old[nf] && !fa_poke(ip + it->len + nf, &old[nf], 1)) {
+					ntr->bytes[nf] = old[nf];
+					on_each_cpu(fa_nop, NULL, 1);
+				}
+			unp = fa_report_unpatched(fm, ip, it->bytes, it->len, why, 0, 0);
+		} else {
+			ntr->evicted = 1;
+			stat_evicted++;
+		}
+		want_patch = false;
+	}
 	if (want_patch) {
 		why = fa_patch_site(fm, tr, ip, cur);
 		/* an integer instruction that is not patched just keeps running as it is */
@@ -1302,6 +1533,10 @@ static void fa_slow(struct pt_regs *regs)
 	tr = xa_load(&fm->tr, ip);
 	if (!tr || n < tr->len || memcmp(buf, tr->bytes, tr->len)) {
 		if (fa_decode(buf, n, ip, &in) < 0) {
+			/* rewritten by eviction in the parent of this process? */
+			tr = fa_evicted_find(fm, ip, buf, n);
+			if (tr)
+				goto found;
 			/* an encoding the decoder does not know: say so, the program dies */
 			stat_unsupported++;
 			pr_info_ratelimited("%s[%d]: unsupported instruction at %lx: %*ph\n",
@@ -1332,6 +1567,7 @@ static void fa_slow(struct pt_regs *regs)
 					    current->comm, current->pid, ip, in.len, buf);
 		}
 	}
+found:
 	if (!tr->stub)
 		goto out;
 	if (tr->unp && !tr->dv_tried && atomic_long_read(&tr->hits) >= FA_DIVERT_HITS &&
@@ -1384,6 +1620,8 @@ static int fa_die(struct notifier_block *nb, unsigned long val, void *data)
 				}
 				regs->ip = tr->stub;
 				stat_fast++;
+				if (tr->evicted)
+					stat_evict_traps++;
 				return NOTIFY_STOP;
 			}
 		}

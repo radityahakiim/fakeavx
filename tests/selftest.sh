@@ -83,7 +83,7 @@ run() {
 have() { command -v "$1" >/dev/null 2>&1; }
 
 P=/sys/module/fakeavx/parameters
-STATS="slow fast translated regions regions_borrowing patched patched_short unpatched diverted unsupported"
+STATS="slow fast translated regions regions_borrowing patched patched_short unpatched diverted evicted evict_traps unsupported"
 stats() { for s in $STATS; do printf '%s=%s ' "$s" "$(cat "$P/stat_$s" 2>/dev/null || echo 0)"; done; }
 
 module_loaded=0
@@ -100,8 +100,8 @@ run build-helpers make -C helpers
 run build-module make module
 if [ $rc = 0 ]; then record "build: kernel module" PASS "kmod/fakeavx.ko" $secs
 else record "build: kernel module" FAIL "see build-module.log (kernel headers?)" $secs; fi
-run build-tests make -C tests helperbench fuzz difftest
-[ $rc = 0 ] && record "build: test programs" PASS "helperbench fuzz difftest" $secs || record "build: test programs" FAIL "see build-tests.log" $secs
+run build-tests make -C tests helperbench fuzz difftest evict_test
+[ $rc = 0 ] && record "build: test programs" PASS "helperbench fuzz difftest evict_test" $secs || record "build: test programs" FAIL "see build-tests.log" $secs
 run build-prof make prof
 [ $rc = 0 ] && record "build: fakeavx-prof" PASS "" $secs || record "build: fakeavx-prof" FAIL "see build-prof.log" $secs
 run build-guest make guest
@@ -140,13 +140,17 @@ done
 run fuzz tests/fuzz "$N_FUZZ"
 [ $rc = 0 ] && record "fuzz (ASan/UBSan)" PASS "$N_FUZZ inputs" $secs || record "fuzz (ASan/UBSan)" FAIL "exit $rc, see fuzz.log" $secs
 
-run timing-strhttp "$HB" strhttp
+# what the userspace translator runs must suit this CPU (an SSSE3-only host cannot run SSE4.1)
+hostenv=HB_PENRYN=1
+grep -qw sse4_1 /proc/cpuinfo || hostenv=HB_NOSSE41=1
+
+run timing-strhttp env $hostenv "$HB" strhttp
 la6=$(awk '$1=="0x4" && $2==6 {print $3}' "$log"); la16=$(awk '$1=="0x4" && $2==16 {print $3}' "$log")
 record "time: picohttpparser pcmpestri" INFO "ranges la=6: ${la6:-?} cycles, la=16: ${la16:-?} cycles" $secs
-run timing-strcost "$HB" strcost
+run timing-strcost env $hostenv "$HB" strcost
 worst=$(awk 'NR>2 {for (i=4;i<=6;i++) if ($i>m) {m=$i; w=$1" "$2" "$3}} END {print m" ("w")"}' "$log")
 record "time: pcmpXstrX, all modes" INFO "worst case $worst cycles" $secs
-run timing-helpers "$HB" time
+run timing-helpers env $hostenv "$HB" time
 sel=$(awk '$1 ~ /^(pcmpgtq|vpermd_y|vpmaskmovd_ld_y|vpgatherdd_y|pcmpistri|crc32q|popcnt64)$/ {printf "%s %.0f, ", $1, $2}' "$log")
 record "time: helper paths" INFO "${sel%, } cycles" $secs
 
@@ -186,23 +190,29 @@ if [ $do_module = 1 ]; then
 		|| record "VEX vs legacy, under the module" FAIL "$(tail -1 "$log")" $secs
 
 	t0=$(date +%s)
-	cmp <("$HB" dump "" "$N_DUMP") <("$HB" mdump "" "$N_DUMP") >"$logs/mdump.log" 2>&1
+	cmp <(env $hostenv "$HB" dump "" "$N_DUMP") <("$HB" mdump "" "$N_DUMP") >"$logs/mdump.log" 2>&1
 	rc1=$?
-	cmp <("$HB" rdump "" "$N_DUMP") <("$HB" mrdump "" "$N_DUMP") >>"$logs/mdump.log" 2>&1
+	cmp <(env $hostenv "$HB" rdump "" "$N_DUMP") <("$HB" mrdump "" "$N_DUMP") >>"$logs/mdump.log" 2>&1
 	rc2=$?
 	secs=$(( $(date +%s) - t0 ))
-	cmp <("$HB" gdump "" 10) <("$HB" mgdump "" 10) >>"$logs/mdump.log" 2>&1
+	cmp <(env $hostenv "$HB" gdump "" 10) <("$HB" mgdump "" 10) >>"$logs/mdump.log" 2>&1
 	rc3=$?
 	[ $rc3 = 0 ] || rc1=1
-	cmp <("$HB" pdump "" 300) <("$HB" mpdump "" 300) >>"$logs/mdump.log" 2>&1
+	cmp <(env $hostenv "$HB" pdump "" 300) <("$HB" mpdump "" 300) >>"$logs/mdump.log" 2>&1
 	[ $? = 0 ] || rc1=1
 	secs=$(( $(date +%s) - t0 ))
-	nins=$("$HB" dump "" 1 | wc -l); nloop=$("$HB" rdump "" 1 | wc -l)
+	nins=$(env $hostenv "$HB" dump "" 1 | wc -l); nloop=$(env $hostenv "$HB" rdump "" 1 | wc -l)
 	if [ $rc1 = 0 ] && [ $rc2 = 0 ]; then
 		record "module vs userspace translator" PASS "$nins instructions + $nloop loops x $N_DUMP inputs, 2048 gather encodings x 10, 48 vpermd/vpermps forms x 300, identical" $secs
 	else
 		record "module vs userspace translator" FAIL "differs: see mdump.log" $secs
 	fi
+
+	# short sites in a non-PIE binary: eviction, direct entries, a forked child
+	run evict tests/evict_test 2000
+	r=$(grep -E "steady state" "$log" | sed 's/^ *//')
+	if [ $rc = 0 ]; then record "eviction (non-PIE short sites)" PASS "$(tail -1 "$log" | sed 's/^evict_test: //'); $r" $secs
+	else record "eviction (non-PIE short sites)" FAIL "$(tail -1 "$log"); see evict.log" $secs; fi
 
 	for g in guest_test unpatched_test; do
 		run "guest-$g" "tests/guest/$g"
