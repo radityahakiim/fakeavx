@@ -526,3 +526,26 @@ helper blob.
 **Precision of faults.** Stubs are resume-correct but not precise: a faulting
 memory operand may leave a destination register or the first half of a 256-bit
 store already written.
+
+**MXCSR in the helper.** To cut the helper call's fixed cost, `helper_entry`
+no longer saves and restores MXCSR around the C code; `fp_cmp` and
+`fp_sse41` (helper.c) do it themselves, around the only code that computes
+in floating point. That holds only as long as the compiler puts no
+floating-point instruction anywhere else, which nothing in C enforces (GCC
+vectorizes `do_cmp` into `cmpltps`, for instance). `helpers/check_fp.sh`
+runs on every blob build: floating-point instructions may appear only in
+`do_cmp`, `do_sse41`, `round_f` and `round_d`, and those may only be called
+from the functions that save MXCSR. Removing `do_cmp` from the allowed list,
+or `do_sse41` from the callers, fails the build.
+
+**Undoing an eviction.** An evicted instruction that is entered directly
+traps. For an integer instruction that is a new cost, so after 16 such
+entries the eviction is undone. The same applies to an AVX instruction whose
+first byte was `e9`: it had a jump of its own, which the eviction overwrote,
+and undoing gives it back. An AVX instruction without one trapped on direct
+entry before the eviction as well; undoing it would only make the short
+instruction trap too, so it stays evicted. The undo is tried once; if memory
+is no longer as the eviction left it, the instruction stays evicted and its
+traps stay on the fast path. `tests/evict_test` covers the case: 2000 direct
+entries trap 16 times, then the restored jump takes 2000 more without a
+trap (the previous module: 2000 and 2000).

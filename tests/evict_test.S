@@ -22,6 +22,9 @@
  * u32 ev_e(const u8 *p, const u8 *q): movemask(p[0..15] == q[0..15])
  *   vpxor (4) -> vmovdqu (5: patched directly, before vpxor is handled, so
  *   its first byte is already e9 when vpxor gets to evict it).
+ * ev_ge: same result, jumping straight into that vmovdqu (ev_e_n). Its own
+ *   jump was taken by the eviction, so this traps until the eviction is
+ *   undone and gives it back; from then on it does not trap at all.
  * ev_gc / ev_gd: same results, jumping straight into the mov (ev_c_n,
  *   ev_d_n). The test enters ev_c_n in the parent until the eviction is
  *   undone, and ev_d_n only in a forked child, which has no records.
@@ -94,9 +97,15 @@ ev_gd:
 	.p2align 4
 ev_e:
 	vpxor %xmm3, %xmm3, %xmm3		/* c5 e1 ef db */
+ev_e_n:
 	.byte 0xc5, 0xfa, 0x6f, 0x4e, 0x00	/* vmovdqu 0(%rsi),%xmm1 */
 	vpcmpeqb (%rdi), %xmm1, %xmm2		/* c5 f1 74 17 */
 	vpmovmskb %xmm2, %eax			/* c5 f9 d7 c2 */
 	ret
+
+	.globl ev_ge
+	.p2align 4
+ev_ge:
+	jmp ev_e_n
 
 	.section .note.GNU-stack,"",@progbits

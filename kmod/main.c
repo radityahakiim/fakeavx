@@ -111,7 +111,8 @@ struct fa_tr {
 	u8 dv_tried;		/* fa_divert() has been tried */
 	u8 evicted;		/* first byte(s) rewritten by eviction (fa_ev_window()): */
 #define FA_EV_OURS	1	/*   an instruction of ours */
-#define FA_EV_INT	2	/*   an integer instruction: undone when entered too often */
+#define FA_EV_INT	2	/*   an integer instruction */
+	u8 ev_undo;		/* undone when entered directly too often (fa_ev_undo()) */
 	u64 ev_rec;		/* then: its struct fa_ev_rec in the code cache */
 	u32 unp;		/* its entry in /proc/fakeavx/unpatched, if any */
 	atomic_long_t hits;	/* traps since then */
@@ -964,6 +965,18 @@ static int fa_ev_poke(struct fa_tr *ntr, unsigned long nip, const u8 *nb, int nf
 static struct fa_tr *fa_tr_store(struct fa_mm *fm, unsigned long ip, u64 stub,
 				 const u8 *bytes, int len);
 
+/*
+ * Is an eviction worth undoing when the evicted instruction is entered
+ * directly too often? An integer instruction never trapped before. One of
+ * ours had its own jump if its first byte was e9, which eviction took and
+ * an undo gives back. One of ours without a jump trapped on direct entry
+ * anyway: undoing would only make the short instruction trap as well.
+ */
+static bool fa_ev_undoable(int kind, u8 first)
+{
+	return kind == FA_EV_INT || (kind == FA_EV_OURS && first == 0xe9);
+}
+
 /* Find the record of an instruction rewritten by eviction, in a process that lacks it (fork). */
 static struct fa_tr *fa_evicted_find(struct fa_mm *fm, unsigned long ip, const u8 *buf, int n)
 {
@@ -986,6 +999,7 @@ static struct fa_tr *fa_evicted_find(struct fa_mm *fm, unsigned long ip, const u
 		tr = fa_tr_store(fm, ip, rec.entry, buf, rec.len);
 		if (tr) {
 			tr->evicted = rec.kind;
+			tr->ev_undo = fa_ev_undoable(rec.kind, rec.n_orig[0]);
 			tr->ev_rec = stub + FA_EV_OFF;
 		}
 		return tr;
@@ -997,13 +1011,15 @@ static u32 fa_report_unpatched(struct fa_mm *fm, unsigned long ip, const u8 *byt
 				int why, unsigned long lo, unsigned long hi);
 
 /*
- * An evicted integer instruction (tr, at ip) is entered directly too often:
- * give it its bytes back, and the short instruction before it, whose jump
- * borrowed them, goes back to trapping. That instruction traps by nature
- * (it is one of ours), so the order is: its byte 0 -> 0xc4 (a VEX prefix,
- * traps whatever follows), its other bytes back, the integer instruction's
- * bytes back (last first), then its own byte 0; a serializing IPI after each.
- * Called with fm->lock held.
+ * An evicted instruction (tr, at ip) is entered directly too often: give it
+ * its bytes back, and the short instruction before it, whose jump borrowed
+ * them, goes back to trapping. Only where that helps (fa_ev_undoable()): an
+ * integer instruction runs as it is again, one of ours gets its own jump
+ * back. The short instruction traps by nature (it is one of ours), so the
+ * order is: its byte 0 -> 0xc4 (a VEX prefix, traps whatever follows), its
+ * other bytes back, the evicted instruction's bytes back (last first, so a
+ * jump is complete before its e9 returns), then the short instruction's
+ * byte 0; a serializing IPI after each. Called with fm->lock held.
  */
 static void fa_ev_undo(struct fa_mm *fm, unsigned long ip, struct fa_tr *tr)
 {
@@ -1013,7 +1029,8 @@ static void fa_ev_undo(struct fa_mm *fm, unsigned long ip, struct fa_tr *tr)
 	int k;
 
 	if (copy_from_user(&rec, (void __user *)tr->ev_rec, sizeof(rec)) ||
-	    rec.magic != FA_EV_MAGIC || rec.ip != ip || rec.kind != FA_EV_INT ||
+	    rec.magic != FA_EV_MAGIC || rec.ip != ip || rec.kind != tr->evicted ||
+	    !fa_ev_undoable(rec.kind, rec.n_orig[0]) ||
 	    rec.slen < 3 || rec.slen > 4 || rec.nf != 5 - rec.slen || rec.sip + rec.slen != ip)
 		return;
 	if (copy_from_user(b, (void __user *)rec.sip, 5) || b[0] != 0xe9 ||
@@ -1395,6 +1412,7 @@ static struct fa_tr *fa_make_entry(struct fa_mm *fm, struct fa_region *main,
 		} else {
 			atomic_long_set(&ntr->hits, 0);
 			ntr->ev_rec = addr + FA_EV_OFF;
+			ntr->ev_undo = fa_ev_undoable(ev_kind, old[0]);
 			ntr->evicted = ev_kind;
 			stat_evicted++;
 			if (ev_kind == FA_EV_INT)
@@ -1683,10 +1701,11 @@ static void fa_slow(struct pt_regs *regs)
 found:
 	if (!tr->stub)
 		goto out;
-	if (tr->evicted == FA_EV_INT && atomic_long_read(&tr->hits) >= FA_EVICT_HITS) {
+	if (tr->evicted && tr->ev_undo && atomic_long_read(&tr->hits) >= FA_EVICT_HITS) {
+		tr->ev_undo = 0;	/* once: on failure it stays evicted */
 		fa_ev_undo(fm, ip, tr);
 		if (!tr->evicted)
-			goto out;	/* its own bytes again: it runs as it is */
+			goto out;	/* its own bytes again: it runs as it is, or jumps */
 	}
 	if (tr->unp && !tr->dv_tried && atomic_long_read(&tr->hits) >= FA_DIVERT_HITS &&
 	    divert && patch) {
@@ -1738,7 +1757,7 @@ static int fa_die(struct notifier_block *nb, unsigned long val, void *data)
 				}
 				if (tr->evicted) {
 					stat_evict_traps++;
-					if (tr->evicted == FA_EV_INT &&
+					if (READ_ONCE(tr->ev_undo) &&
 					    atomic_long_inc_return(&tr->hits) >= FA_EVICT_HITS)
 						goto slow;	/* fa_ev_undo() */
 				}

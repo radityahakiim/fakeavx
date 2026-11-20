@@ -16,9 +16,10 @@ helper.o: helper.c helper.h ../core/fakeavx.h
 # entered without saving xmm registers: must not use any
 helper_int.o: helper_int.c helper.h ../core/fakeavx.h
 	$(CC) $(BLOB_CFLAGS) -mgeneral-regs-only -c -o $@ $<
-blob.elf: entry.o helper.o helper_int.o sse41.o blob.lds
+blob.elf: entry.o helper.o helper_int.o sse41.o blob.lds check_fp.sh
 	ld -static -nostdlib --gc-sections -T blob.lds -o $@ entry.o helper.o helper_int.o sse41.o
 	@if readelf -S $@ | grep -E '\.(data|bss|got)' ; then echo "blob has writable data"; rm -f $@; exit 1; fi
+	@./check_fp.sh $@ || { rm -f $@; exit 1; }
 blob.bin: blob.elf
 	objcopy -O binary -j .text $< $@
 blob.h: blob.bin

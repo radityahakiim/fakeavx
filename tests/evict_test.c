@@ -11,7 +11,9 @@
  *   3. jumps straight into evicted AVX instructions (they trap into their
  *      records and still compute the right thing);
  *   4. jumps straight into an evicted integer instruction until the
- *      eviction is undone, then the normal entry again;
+ *      eviction is undone, then the normal entry again; the same for an
+ *      evicted AVX instruction that had a jump of its own (undone, and the
+ *      jump is back: no traps there afterwards);
  *   5. fork(): a child, which has the memory but none of the records, jumps
  *      into the evicted instructions first (and undoes the integer one it
  *      never saw), then uses the normal entries.
@@ -36,6 +38,7 @@ u32 ev_gc(u32 x, u32 y);
 u32 ev_d(u32 x, u32 y);
 u32 ev_gd(u32 x, u32 y);
 u32 ev_e(const u8 *p, const u8 *q);
+u32 ev_ge(const u8 *p, const u8 *q);
 
 static u32 ref_a(const u8 *p, const u8 *q)
 {
@@ -123,7 +126,7 @@ static int check(const char *what, int n, int direct, int which)
 		}
 		if (which & F_E) {
 			want[4] = ref_a(bufp, bufq) & 0xffff;
-			got[4] = ev_e(bufp, bufq);
+			got[4] = direct ? ev_ge(bufp, bufq) : ev_e(bufp, bufq);
 		}
 		for (int j = 0; j < 5; j++)
 			if (got[j] != want[j] && bad++ < 3)
@@ -138,6 +141,7 @@ int main(int argc, char **argv)
 	int rounds = argc > 1 ? atoi(argv[1]) : 2000, bad = 0, status;
 	int new_module = st("evicted") >= 0, int_module = st("evict_undone") >= 0;
 	long ev0 = st("evicted"), ei0 = st("evicted_int"), f0, f1, et0, et1, s0, s1, u0, u1;
+	long ee_traps = 0, ee_undone = 0, ee_after = 0;
 	pid_t pid;
 
 	if (st("fast") < 0) {
@@ -174,6 +178,20 @@ int main(int argc, char **argv)
 	if (int_module)
 		printf("  direct entries into the evicted integer instruction: %d calls, %ld traps there, undone %ld time(s)\n",
 		       rounds, et1 - et0, u1 - u0);
+
+	/* an evicted AVX instruction with a jump of its own: undone, jump back */
+	et0 = st("evict_traps");
+	u0 = st("evict_undone");
+	bad += check("direct avx", rounds, 1, F_E);
+	ee_traps = st("evict_traps") - et0;
+	ee_undone = st("evict_undone") - u0;
+	f0 = st("fast");
+	bad += check("direct avx after undo", rounds, 1, F_E);
+	ee_after = st("fast") - f0;
+	bad += check("avx after undo", rounds, 0, F_E);
+	if (int_module)
+		printf("  direct entries into the evicted AVX instruction that had a jump: %d calls, %ld traps there, undone %ld time(s); then %ld traps in %d more\n",
+		       rounds, ee_traps, ee_undone, ee_after, rounds);
 
 	fflush(stdout);
 	s0 = st("slow");
@@ -212,6 +230,8 @@ int main(int argc, char **argv)
 		printf("evict_test: FAIL (%d wrong)\n", bad);
 	else if (new_module && f1 - f0 > rounds / 20)
 		printf("evict_test: FAIL (results right, but the entries still trap)\n"), bad = 1;
+	else if (int_module && (ee_undone != 1 || ee_traps > 20 || ee_after > rounds / 20))
+		printf("evict_test: FAIL (AVX eviction with a jump of its own not undone)\n"), bad = 1;
 	else
 		printf("evict_test: ok%s\n", new_module ? "" : " (results; eviction not in this module)");
 	return bad ? 1 : 0;

@@ -107,7 +107,7 @@ Module parameters (`/etc/modprobe.d/fakeavx.conf`, or
 | `divert` | 1 | When an instruction that could not be patched keeps trapping, patch the instruction before it instead (below). |
 | `evict` | 1 | When a 3-4 byte instruction's jump window is unusable, rewrite the first byte(s) of the next instruction (one the same region translates or carries) to move the window (below). |
 | `autocpuid` | 1 | Find a binary's `cpuid` instructions automatically (below). |
-| `stat_*` | — | Read-only counters, e.g. `stat_slow` (first-time traps), `stat_fast` (repeat traps), `stat_regions`, `stat_patched`, `stat_cpuid`, `stat_scans`, `stat_unsupported`, `stat_short_refused` (3-4 byte instructions left trapping because their stub window was unavailable), `stat_unpatched` (all instructions left trapping, for any reason), `stat_diverted` (of those, how many were then diverted at the instruction before), `stat_evicted` (short instructions patched by rewriting the next one; `stat_evicted_int`: of them, where the next one is an integer instruction), `stat_evict_traps` (direct jumps into such a rewritten instruction, each a trap), `stat_evict_undone` (integer instructions given their bytes back after 16 such jumps). |
+| `stat_*` | — | Read-only counters, e.g. `stat_slow` (first-time traps), `stat_fast` (repeat traps), `stat_regions`, `stat_patched`, `stat_cpuid`, `stat_scans`, `stat_unsupported`, `stat_short_refused` (3-4 byte instructions left trapping because their stub window was unavailable), `stat_unpatched` (all instructions left trapping, for any reason), `stat_diverted` (of those, how many were then diverted at the instruction before), `stat_evicted` (short instructions patched by rewriting the next one; `stat_evicted_int`: of them, where the next one is an integer instruction), `stat_evict_traps` (direct jumps into such a rewritten instruction, each a trap), `stat_evict_undone` (evictions undone after 16 such jumps: integer instructions given their bytes back, and AVX instructions their own jump). |
 
 `stat_fast` is the number to watch: every count is a full kernel round trip.
 If it keeps climbing while a program runs, that program has hot instructions
@@ -284,8 +284,11 @@ register, and prints both values when they differ.
   64-bit mode and that moves the window above the heap: the region runs that
   instruction from the cache, and a jump straight to it traps into its
   record (after `fork()`, the child finds it through a record kept in the
-  code cache). An integer instruction, which would not trap otherwise, gets
-  its bytes back after 16 such jumps, and the short instruction traps again. Otherwise an earlier integer instruction is patched instead
+  code cache). After 16 such jumps the eviction is undone where that helps,
+  and the short instruction traps again: an integer instruction, which would
+  not trap otherwise, gets its bytes back, and so does an AVX instruction
+  that had a jump of its own (the eviction took it). An AVX instruction
+  without one trapped on direct entry anyway and stays evicted. Otherwise an earlier integer instruction is patched instead
   where possible (`divert`). What is left — e.g. `vzeroupper` before `ret`,
   or an instruction right after a `call` — still traps once per execution.
   Watch `/proc/fakeavx/unpatched`; building with `-fPIE -pie` or
@@ -350,5 +353,7 @@ and extra arguments are passed to `insmod` (e.g. `./run.sh patch=0`).
 | Legacy SSE/SSE2/SSE3/SSSE3/MMX carried inside regions: decoder vs. Capstone (393,000 accepted, 309,000 from real code incl. Bun and Claude Code); region test `mixsse` with borrowed registers | development machine | 0 divergences; pass (and fails when the register accounting is removed) |
 | Inline `vpcmpgtq`, `vptest ymm`, `vtestps/pd`, variable shifts, and a table-driven `crc32` routine instead of the C helper | development machine (1.18 M differential instances, mutation-checked), QEMU both CPU models (`fakeavx-prof --check` 198/198) | 0 mismatches |
 | `fakeavx-prof --check`: 198 instruction forms bit-exact against real AVX2 through the module | QEMU, `-cpu Penryn` and `-cpu core2duo` | 198/198 match, none trapping after translation |
+| Eviction undone for an AVX instruction that had its own jump (`tests/evict_test`) | QEMU, both CPU models | 16 traps, then 0 in 2000 direct entries (previous module: 2000 and 2000) |
+| Floating point only where MXCSR is saved (`helpers/check_fp.sh`, on every blob build) | development machine | passes; fails with either rule mutated |
 | `scripts/install.sh` (DKMS, systemd units) | — | **not run**: only the file layout was checked |
 | Automatic mode, SSSE3 support | real hardware | **not yet run** |
