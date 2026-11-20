@@ -549,3 +549,29 @@ is no longer as the eviction left it, the instruction stays evicted and its
 traps stay on the fast path. `tests/evict_test` covers the case: 2000 direct
 entries trap 16 times, then the restored jump takes 2000 more without a
 trap (the previous module: 2000 and 2000).
+
+**Shorter inline sequences.** Reworked with the same results bit for bit
+(differential test against AVX2, `tests/helper_oracle.sh` against the
+previous build, a planted bug in each caught):
+- `vptest`/`vtestps`/`vtestpd`: c = src2 ^ (src1 & src2) instead of
+  (src1 | src2) ^ src1 (one copy less), `pandn` where src2 is a register,
+  and the fold into one ptest operand is a single `packssdw` (signed
+  saturation keeps each dword's zero or non-zero) instead of
+  `punpcklqdq`/`punpckhqdq`/`por`; the "low qword set" mask is a blob
+  constant. 20 -> 13 instructions (ymm, in a loop).
+- Variable shifts: each count is fetched by itself, `movd`/`movq` from
+  memory or the upper half's slot, `pmovzxdq`, `psrlq $32` or `pshufd` from a
+  register, instead of copy + `psrldq` + `pmovzxdq`; a qword count already in
+  place is used as the operand. `vpsllvd` 46 -> 38, `vpsrlvq` 18 -> 14.
+- `vpermd`/`vpermps`: the control bytes get 0x70 added, which moves index
+  bit 2 into bit 7, where `pshufb` writes zero; the second shuffle uses the
+  control + 0x80. The two shuffles are then just ORed: no select mask, no
+  blend. 33 -> 25 (SSSE3 only, so also on Merom).
+- `vpcmpgtq`: b is used where it is unless it comes from guest memory, 24 -> 22
+  (and one scratch register fewer to save when translated alone).
+- `vpbroadcastb`/`w`: one `pshufb` against a zero or 0,1 constant instead of
+  `punpcklbw` + `pshuflw` + `punpcklqdq`, 5 -> 3.
+The blob constants are placed with `.org` at their fakeavx.h offsets, so a
+mismatch fails the build. Not changed: `vpmovmskb ymm` (its six `lea` could be
+`xchg %ch,%cl` + `bswap`, but the byte-register write stalls on Core 2) and
+`vzeroupper` (16 stores of the upper halves, already minimal).

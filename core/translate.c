@@ -804,11 +804,8 @@ static void do_bcast(struct ctx *c)
 	case 0x19: case 0x59:
 		emit(c, 0x66, 1, 0x6c, D, REG(D), 0, -1);		/* punpcklqdq */
 		break;
-	default:
-		if (o == 0x78)
-			emit(c, 0x66, 1, 0x60, D, REG(D), 0, -1);	/* punpcklbw */
-		emit(c, 0xf2, 1, 0x70, D, REG(D), 0, 0);		/* pshuflw */
-		emit(c, 0x66, 1, 0x6c, D, REG(D), 0, -1);
+	default:	/* pshufb: byte 0, or word 0, everywhere */
+		emit(c, 0x66, 2, 0x00, D, BLOB(o == 0x78 ? FA_BLOB_ZERO : FA_BLOB_BCASTW), 0, -1);
 		break;
 	}
 	if (in->L)
@@ -1452,22 +1449,31 @@ static void lane_out(struct ctx *c, int T, int l)
 /*
  * vpcmpgtq: a > b (signed) is the sign of (b & ~a) | (~(a ^ b) & (b - a)),
  * exact even where b - a overflows; then spread the sign over the qword.
+ * b is used where it is (register, or its upper half's slot or register);
+ * only from guest memory, which may be unaligned, is it copied first.
  */
 static void do_pcmpgtq(struct ctx *c)
 {
-	int A = c->in->vvvv, l, T1 = xscratch(c), T2 = xscratch(c), T3 = xscratch(c);
+	int A = c->in->vvvv, l, T1 = xscratch(c), T2 = xscratch(c), T3 = -1;
 
 	for (l = c->in->L; l >= 0; l--) {
-		struct opnd a = lane_opnd(c, A, l);
+		struct opnd a = lane_opnd(c, A, l), b;
 
 		lane_rm(c, T1, l);			/* b */
-		mov_rr(c, T3, T1);			/* b */
+		if (is_mem(c)) {
+			if (T3 < 0)
+				T3 = xscratch(c);
+			mov_rr(c, T3, T1);
+			b = REG(T3);
+		} else {
+			b = lane_opnd(c, c->in->rm, l);
+		}
 		sse2(c, 0xfb, T1, a, -1);		/* psubq: b - a */
 		lane_reg(c, T2, A, l);
-		sse2(c, 0xef, T2, REG(T3), -1);		/* pxor: a ^ b */
+		sse2(c, 0xef, T2, b, -1);		/* pxor: a ^ b */
 		sse2(c, 0xdf, T2, REG(T1), -1);		/* pandn: ~(a ^ b) & (b - a) */
 		lane_reg(c, T1, A, l);
-		sse2(c, 0xdf, T1, REG(T3), -1);		/* pandn: ~a & b */
+		sse2(c, 0xdf, T1, b, -1);		/* pandn: ~a & b */
 		sse2(c, 0xeb, T1, REG(T2), -1);		/* por */
 		sse2(c, 0x72, 4, REG(T1), 31);		/* psrad $31 */
 		sse2(c, 0x70, T1, REG(T1), 0xf5);	/* pshufd: high dword to both */
@@ -1480,28 +1486,44 @@ static void do_pcmpgtq(struct ctx *c)
 /*
  * vptest (256-bit), vtestps, vtestpd: ZF = (src1 & src2) == 0 and
  * CF = (~src1 & src2) == 0 over all lanes (only the sign bits for vtest).
- * Both are folded into one register, z in the low qword and c in the high
- * one, and a single ptest against "low qword set" yields both flags.
+ * z = src1 & src2 and c = src2 ^ z (= ~src1 & src2) are ORed over the lanes,
+ * then packssdw packs them into one register, z in the low qword and c in
+ * the high one (signed saturation keeps every dword's zero or non-zero),
+ * and a single ptest against "low qword set" yields both flags.
  */
 static void do_vtest(struct ctx *c, int bits)	/* 0: all, 32 / 64: sign bits */
 {
-	int S = c->in->reg, l, T1 = xscratch(c), T2 = xscratch(c), T3 = xscratch(c);
+	int S = c->in->reg, l, T1 = xscratch(c), T2 = xscratch(c), T3 = -1;
 
 	for (l = c->in->L; l >= 0; l--) {
 		struct opnd a = lane_opnd(c, S, l);
-		int and = l == c->in->L ? T1 : T3;
 
-		lane_rm(c, and, l);
-		sse2(c, 0xdb, and, a, -1);		/* pand: src1 & src2 */
-		if (and != T1)
+		if (l == c->in->L) {
+			lane_rm(c, T2, l);			/* src2 */
+			mov_rr(c, T1, T2);
+			sse2(c, 0xdb, T1, a, -1);		/* pand: z */
+			sse2(c, 0xef, T2, REG(T1), -1);		/* pxor: c = src2 ^ z */
+			continue;
+		}
+		if (T3 < 0)
+			T3 = xscratch(c);
+		if (is_mem(c)) {
+			lane_rm(c, T3, l);
+			sse2(c, 0xdb, T3, a, -1);		/* pand: z */
 			sse2(c, 0xeb, T1, REG(T3), -1);
-		lane_rm(c, T3, l);
-		sse2(c, 0xeb, T3, a, -1);		/* por */
-		sse2(c, 0xef, T3, a, -1);		/* pxor: (s1 | s2) ^ s1 = ~s1 & s2 */
-		if (l == c->in->L)
-			mov_rr(c, T2, T3);
-		else
-			sse2(c, 0xeb, T2, REG(T3), -1);
+			lane_rm(c, T3, l);
+			sse2(c, 0xeb, T3, a, -1);		/* por */
+			sse2(c, 0xef, T3, a, -1);		/* pxor: (s1 | s2) ^ s1 = c */
+		} else {
+			struct opnd b = lane_opnd(c, c->in->rm, l);
+
+			lane_reg(c, T3, S, l);
+			sse2(c, 0xdb, T3, b, -1);		/* pand: z */
+			sse2(c, 0xeb, T1, REG(T3), -1);
+			lane_reg(c, T3, S, l);
+			sse2(c, 0xdf, T3, b, -1);		/* pandn: c */
+		}
+		sse2(c, 0xeb, T2, REG(T3), -1);
 	}
 	if (bits == 32) {
 		sse2(c, 0x72, 2, REG(T1), 31);		/* psrld $31 */
@@ -1510,12 +1532,8 @@ static void do_vtest(struct ctx *c, int bits)	/* 0: all, 32 / 64: sign bits */
 		sse2(c, 0x73, 2, REG(T1), 63);		/* psrlq $63 */
 		sse2(c, 0x73, 2, REG(T2), 63);
 	}
-	mov_rr(c, T3, T1);
-	sse2(c, 0x6c, T3, REG(T2), -1);			/* punpcklqdq: [z.lo, c.lo] */
-	sse2(c, 0x6d, T1, REG(T2), -1);			/* punpckhqdq: [z.hi, c.hi] */
-	sse2(c, 0xeb, T1, REG(T3), -1);			/* por */
-	sse2(c, 0x76, T2, REG(T2), -1);			/* pcmpeqd: all ones */
-	sse2(c, 0x73, 3, REG(T2), 8);			/* psrldq $8: low qword set */
+	sse2(c, 0x6b, T1, REG(T2), -1);			/* packssdw: [z, c] */
+	load_gs(c, T2, BLOB(FA_BLOB_LOQ));		/* low qword set */
 	emit(c, 0x66, 2, 0x17, T2, REG(T1), 0, -1);	/* ptest */
 }
 
@@ -1526,6 +1544,52 @@ static void do_vtest(struct ctx *c, int bits)	/* 0: all, 32 / 64: sign bits */
  * so each count is zero-extended into its own register, the whole lane
  * shifted by it, and the one element kept with pblendw.
  */
+
+/* count element i of lane l, zero-extended to 64 bits, in T or where it already is */
+static struct opnd shift_count(struct ctx *c, int T, int l, int i, int q)
+{
+	int sz = q ? 8 : 4, R;
+	struct opnd o = is_mem(c) ? MEM(16 * l + sz * i) : lane_opnd(c, c->in->rm, l);
+
+	if (o.type == O_GS) {
+		if (q && !i)
+			return o;			/* aligned m128: its low qword */
+		o.off += sz * i;
+	}
+	if (o.type != O_REG) {
+		if (q)
+			emit(c, 0xf3, 1, 0x7e, T, o, 0, -1);	/* movq m64 */
+		else
+			emit(c, 0x66, 1, 0x6e, T, o, 0, -1);	/* movd m32 */
+		return REG(T);
+	}
+	R = o.reg;
+	if (q) {
+		if (!i)
+			return o;
+		sse2(c, 0x70, T, REG(R), 0xee);		/* pshufd: high qword down */
+		return REG(T);
+	}
+	switch (i) {
+	case 0:
+		emit(c, 0x66, 2, 0x35, T, REG(R), 0, -1);	/* pmovzxdq */
+		break;
+	case 1:
+		mov_rr(c, T, R);
+		sse2(c, 0x73, 2, REG(T), 32);		/* psrlq $32 */
+		break;
+	case 2:
+		sse2(c, 0x70, T, REG(R), 0xee);		/* pshufd: dwords 2, 3 down */
+		emit(c, 0x66, 2, 0x35, T, REG(T), 0, -1);	/* pmovzxdq */
+		break;
+	default:
+		sse2(c, 0x70, T, REG(R), 0xff);		/* pshufd: dword 3 everywhere */
+		sse2(c, 0x73, 2, REG(T), 32);		/* psrlq $32 */
+		break;
+	}
+	return REG(T);
+}
+
 static void do_varshift(struct ctx *c)
 {
 	const struct fa_insn *in = c->in;
@@ -1537,14 +1601,10 @@ static void do_varshift(struct ctx *c)
 	for (l = in->L; l >= 0; l--) {
 		for (i = 0; i < (q ? 2 : 4); i++) {
 			int dst = i ? S : R;
+			struct opnd cnt = shift_count(c, T, l, i, q);
 
-			lane_rm(c, T, l);			/* counts */
-			if (i)
-				sse2(c, 0x73, 3, REG(T), (q ? 8 : 4) * i);	/* psrldq */
-			if (!q)
-				emit(c, 0x66, 2, 0x35, T, REG(T), 0, -1);	/* pmovzxdq */
 			lane_reg(c, dst, A, l);
-			sse2(c, opc, dst, REG(T), -1);
+			sse2(c, opc, dst, cnt, -1);
 			if (i)
 				emit(c, 0x66, 3, 0x0e, R, REG(S), 0,	/* pblendw */
 				     q ? 0xf0 : 3 << (2 * i));
@@ -1561,10 +1621,13 @@ enum { IL_NONE, IL_PCMPGTQ, IL_VTEST, IL_VARSHIFT, IL_PERMD };
 /*
  * vpermd / vpermps ymm (P1.5): dst[i] = src[idx[i] & 7], inline instead of
  * the helper (~100 cycles -> ~15). Per result half, from that half's indices:
- *   control  = pshufb(idx << 2, bcast) + offs, & 0x0f   byte (idx&3)*4 + 0..3
- *   a, b     = pshufb(src.lo, control), pshufb(src.hi, control)
- *   result   = idx bit 2 ? b : a     (mask = idx << 29 >> 31; and/andn/or,
- *              not pblendvb, which would need xmm0)
+ *   v     = (pshufb(idx << 2, bcast) & 0x1c) + (0,1,2,3)   byte (idx&7)*4 + k
+ *   ctl_a = v + 0x70: 0x70-0x7f for idx&4 == 0 (byte v of src.lo),
+ *                     0x80-0x8f otherwise (bit 7: pshufb writes 0)
+ *   ctl_b = ctl_a + 0x80: the other way round, byte v - 16 of src.hi
+ *   result = pshufb(src.lo, ctl_a) | pshufb(src.hi, ctl_b)
+ * (the 0x70 is folded into the offsets constant). pshufb's zeroing does the
+ * selection, so no mask and no blend are needed (pblendvb would need xmm0).
  * SSSE3 and SSE2 instructions only. The destination may be the source or the
  * index register, so the low result waits in a state block slot until the
  * high one is computed too. idx = vvvv, src = rm (register or memory).
@@ -1576,35 +1639,29 @@ static void do_permd(struct ctx *c)
 	int T1 = xscratch(c), T2 = xscratch(c), T3 = xscratch(c);
 
 	for (h = 0; h < 2; h++) {
-		struct opnd ix = h ? HI(I) : REG(I);
-
-		/* T1 = control bytes */
-		load_gs(c, T1, ix);					/* movaps (reg or %gs slot) */
+		/* T1 = ctl_a */
+		load_gs(c, T1, h ? HI(I) : REG(I));			/* movaps (reg or %gs slot) */
 		emit(c, 0x66, 1, 0x72, 6, REG(T1), 0, 2);		/* pslld $2 */
 		emit(c, 0x66, 2, 0x00, T1, BLOB(FA_BLOB_PERMD_BCAST), 0, -1);	/* pshufb */
+		emit(c, 0x66, 1, 0xdb, T1, BLOB(FA_BLOB_PERMD_SEL), 0, -1);	/* pand */
 		emit(c, 0x66, 1, 0xfc, T1, BLOB(FA_BLOB_PERMD_OFFS), 0, -1);	/* paddb */
-		emit(c, 0x66, 1, 0xdb, T1, BLOB(FA_BLOB_NIBBLE), 0, -1);	/* pand */
-		/* T2, T3 = both source halves shuffled */
-		if (mem) {
+		/* T2 = from src.lo, T3 = from src.hi, each 0 where the other one applies */
+		if (mem)
 			loadu(c, T2, 0);
-			loadu(c, T3, 16);
-		} else {
+		else
 			mov_rr(c, T2, S);
-			load_gs(c, T3, HI(S));
-		}
 		emit(c, 0x66, 2, 0x00, T2, REG(T1), 0, -1);		/* pshufb T1, T2 */
+		emit(c, 0x66, 1, 0xef, T1, BLOB(FA_BLOB_HIBIT), 0, -1);	/* pxor: ctl_b */
+		if (mem)
+			loadu(c, T3, 16);
+		else
+			load_gs(c, T3, HI(S));
 		emit(c, 0x66, 2, 0x00, T3, REG(T1), 0, -1);		/* pshufb T1, T3 */
-		/* T1 = all ones where index bit 2 is set; result = T1 ? T3 : T2 */
-		load_gs(c, T1, ix);
-		emit(c, 0x66, 1, 0x72, 6, REG(T1), 0, 29);		/* pslld $29 */
-		emit(c, 0x66, 1, 0x72, 4, REG(T1), 0, 31);		/* psrad $31 */
-		emit(c, 0x66, 1, 0xdb, T3, REG(T1), 0, -1);		/* pand T1, T3 */
-		emit(c, 0x66, 1, 0xdf, T1, REG(T2), 0, -1);		/* pandn T2, T1 */
-		emit(c, 0x66, 1, 0xeb, T1, REG(T3), 0, -1);		/* por T3, T1 */
+		emit(c, 0x66, 1, 0xeb, T2, REG(T3), 0, -1);		/* por T3, T2 */
 		if (!h)
-			store_gs(c, T1, GS(FA_ST_XTMP + 16 * 5));	/* low result, until both are done */
+			store_gs(c, T2, GS(FA_ST_XTMP + 16 * 5));	/* low result, until both are done */
 	}
-	store_gs(c, T1, HI(D));
+	store_gs(c, T2, HI(D));
 	load_gs(c, D, GS(FA_ST_XTMP + 16 * 5));
 }
 

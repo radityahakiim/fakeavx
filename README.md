@@ -355,5 +355,6 @@ and extra arguments are passed to `insmod` (e.g. `./run.sh patch=0`).
 | `fakeavx-prof --check`: 198 instruction forms bit-exact against real AVX2 through the module | QEMU, `-cpu Penryn` and `-cpu core2duo` | 198/198 match, none trapping after translation |
 | Eviction undone for an AVX instruction that had its own jump (`tests/evict_test`) | QEMU, both CPU models | 16 traps, then 0 in 2000 direct entries (previous module: 2000 and 2000) |
 | Floating point only where MXCSR is saved (`helpers/check_fp.sh`, on every blob build) | development machine | passes; fails with either rule mutated |
+| Shorter inline `vptest`/`vtestps/pd` (20 -> 13), variable shifts (46 -> 38, 18 -> 14), `vpermd`/`vpermps` (33 -> 25), `vpcmpgtq` (24 -> 22), `vpbroadcastb` (5 -> 3) | development machine (differential test, all modes; previous build's state dumps; a planted bug in each caught), QEMU both CPU models (`fakeavx-prof --check` 198/198, `vpermd` dumps under the module) | 0 mismatches, identical |
 | `scripts/install.sh` (DKMS, systemd units) | — | **not run**: only the file layout was checked |
 | Automatic mode, SSSE3 support | real hardware | **not yet run** |

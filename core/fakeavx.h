@@ -46,8 +46,12 @@ typedef int64_t s64;
 #define FA_BLOB_HELPER_LEAN 0x18	/* integer helpers: no xmm register saved */
 /* constants for inline translations (16 bytes each, 16-byte aligned) */
 #define FA_BLOB_PERMD_BCAST 0x20	/* byte 0 of each dword to all 4 bytes */
-#define FA_BLOB_PERMD_OFFS 0x30	/* 0,1,2,3 in each dword */
-#define FA_BLOB_NIBBLE	0x40	/* 0x0f in every byte */
+#define FA_BLOB_PERMD_OFFS 0x30	/* 0x70 + (0,1,2,3) in each dword */
+#define FA_BLOB_PERMD_SEL 0x40	/* 0x1c in every byte */
+#define FA_BLOB_HIBIT	0x50	/* 0x80 in every byte */
+#define FA_BLOB_LOQ	0x60	/* low qword all ones, high qword zero */
+#define FA_BLOB_ZERO	0x70	/* zero */
+#define FA_BLOB_BCASTW	0x80	/* 0,1 in every word: pshufb broadcasting word 0 */
 
 #define FA_MAX_STUB	512	/* upper bound for one translated instruction */
 

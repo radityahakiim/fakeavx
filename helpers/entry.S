@@ -20,16 +20,32 @@ _start:
 
 /*
  * Constants for inline translations, at fixed offsets (fakeavx.h), read
- * RIP-relative from the stubs. vpermd/vpermps: the low byte of each dword
- * broadcast to its 4 bytes, the byte offsets within a dword, and 0x0f.
+ * RIP-relative from the stubs. Each is placed with .org at its offset in
+ * fakeavx.h, which fails to assemble if what comes before has grown into it.
  */
-	.balign	16
-permd_bcast:				/* FA_BLOB_PERMD_BCAST */
+	.org	FA_BLOB_PERMD_BCAST
+permd_bcast:		/* vpermd: the low byte of each dword to its 4 bytes */
 	.byte	0, 0, 0, 0, 4, 4, 4, 4, 8, 8, 8, 8, 12, 12, 12, 12
-permd_offs:				/* FA_BLOB_PERMD_OFFS */
-	.byte	0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3
-nibble_mask:				/* FA_BLOB_NIBBLE */
-	.fill	16, 1, 0x0f
+	.org	FA_BLOB_PERMD_OFFS
+permd_offs:		/* vpermd: byte offsets within a dword, + 0x70 (see do_permd) */
+	.byte	0x70, 0x71, 0x72, 0x73, 0x70, 0x71, 0x72, 0x73
+	.byte	0x70, 0x71, 0x72, 0x73, 0x70, 0x71, 0x72, 0x73
+	.org	FA_BLOB_PERMD_SEL
+permd_sel:		/* vpermd: (index & 7) * 4 */
+	.fill	16, 1, 0x1c
+	.org	FA_BLOB_HIBIT
+hibit:			/* 0x80 in every byte */
+	.fill	16, 1, 0x80
+	.org	FA_BLOB_LOQ
+lo_qword:		/* the low qword set: vptest's flag mask */
+	.fill	8, 1, 0xff
+	.fill	8, 1, 0
+	.org	FA_BLOB_ZERO
+zero16:			/* pshufb: byte 0 everywhere (vpbroadcastb) */
+	.fill	16, 1, 0
+	.org	FA_BLOB_BCASTW
+bcast_w:		/* pshufb: word 0 everywhere (vpbroadcastw) */
+	.byte	0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1
 
 /*
  * In:  rdi = descriptor (struct fa_insn), [rsp] = return, [rsp+8] = guest rdi,
