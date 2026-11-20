@@ -1462,6 +1462,12 @@ static bool fa_rgn_reaches(const struct fa_rgn *rg, unsigned long ip)
  * With via, the region starts there instead, at an instruction that falls
  * through to ip, which is translated already (see fa_divert()). Returns the
  * record for via, or NULL if the region does not run into ip.
+ *
+ * Code that is not read-only and file-backed (JIT output, writable memory)
+ * gets one instruction per translation, never a region. A translation is
+ * only checked against the bytes of the instruction it starts at (its record),
+ * and a JIT rewrites code in place: a region would keep running its copy of
+ * the instructions after that one when they change (tests/guest/jit_test).
  */
 static struct fa_tr *fa_translate_region(struct fa_mm *fm, unsigned long ip,
 					 const u8 *buf, int nread, unsigned long via)
@@ -1473,6 +1479,7 @@ static struct fa_tr *fa_translate_region(struct fa_mm *fm, unsigned long ip,
 	struct fa_rgn *rg = fm->rg;
 	u8 order[FA_RG_ITEMS];
 	unsigned long addr, fresh = via ? 0 : ip;	/* gets an entry even if known */
+	bool single = !fa_patchable(fm, ip, 1);
 	int i, j, cand, ret = -1;
 
 	if (!main)
@@ -1489,7 +1496,7 @@ static struct fa_tr *fa_translate_region(struct fa_mm *fm, unsigned long ip,
 		rg->out_addr = addr;
 		rg->blob_addr = main->start;
 		rg->exit_thunk = 0;
-		rg->max_items = tries[i].max_items;
+		rg->max_items = single ? 1 : tries[i].max_items;
 		rg->no_map = tries[i].no_map;
 		rg->no_sse41 = no_sse41;
 		ret = fa_region_build(rg);

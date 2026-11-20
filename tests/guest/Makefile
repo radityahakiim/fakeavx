@@ -1,7 +1,9 @@
 CC ?= gcc
-all: guest_test cpuid_test unpatched_test
+all: guest_test cpuid_test unpatched_test jit_test
 unpatched_test: unpatched_test.c
 	$(CC) -O2 -fPIE -pie -o $@ unpatched_test.c
+jit_test: jit_test.c
+	$(CC) -O2 -o $@ jit_test.c
 cpuid_test: cpuid_test.c
 	$(CC) -O2 -fPIE -msse4.2 -mpopcnt -static-pie -o $@ cpuid_test.c
 ref.o: kern.c kern.h
@@ -11,4 +13,4 @@ avx.o: kern.c kern.h
 guest_test: guest_test.c ref.o avx.o kern.h
 	$(CC) -O2 -fPIE -mavx2 -mpopcnt -static-pie -o $@ guest_test.c ref.o avx.o -lpthread -lm
 clean:
-	rm -f *.o guest_test cpuid_test unpatched_test
+	rm -f *.o guest_test cpuid_test unpatched_test jit_test

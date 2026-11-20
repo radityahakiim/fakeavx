@@ -367,7 +367,12 @@ handler therefore has two paths:
 xarray per mm, torn down from an mmu notifier), not in process memory; a
 forked child simply re-translates on demand. Each entry stores the guest bytes
 it was made from, so stale entries (unmapped library, rewritten JIT code) are
-detected on the fast path. State blocks come from a per-mm pool so that a
+detected on the fast path. Only that one instruction's bytes are checked, so
+code that is not read-only and file-backed (JIT output, writable memory) is
+translated one instruction at a time, never as a region: a JIT rewrites code
+in place, typically patching a constant or jump a few instructions after an
+unchanged first one, and a region kept running its old copy of them (found
+by test; `tests/guest/jit_test`). State blocks come from a per-mm pool so that a
 kprobe on `wake_up_new_task` can hand a new thread its own block from atomic
 context; a kprobe on `do_exit` returns it.
 

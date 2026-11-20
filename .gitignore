@@ -40,3 +40,4 @@ __pycache__/
 
 # tests/selftest.sh reports
 /reports/
+/tests/guest/jit_test

@@ -214,7 +214,7 @@ if [ $do_module = 1 ]; then
 	if [ $rc = 0 ]; then record "eviction (non-PIE short sites)" PASS "$(tail -1 "$log" | sed 's/^evict_test: //'); $r" $secs
 	else record "eviction (non-PIE short sites)" FAIL "$(tail -1 "$log"); see evict.log" $secs; fi
 
-	for g in guest_test unpatched_test; do
+	for g in guest_test unpatched_test jit_test; do
 		run "guest-$g" "tests/guest/$g"
 		r=$(grep RESULT "$log" | tail -1)
 		[ $rc = 0 ] && record "guest: $g" PASS "$r" $secs || record "guest: $g" FAIL "${r:-exit $rc}" $secs

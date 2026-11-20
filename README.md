@@ -307,7 +307,9 @@ register, and prints both values when they differ.
   partly written. Resuming after the fault is correct.
 - Debuggers show XMM registers only.
 - Only read-only file-backed code is patched. JIT-generated code works but
-  traps on every execution of an AVX instruction.
+  traps on every execution of an AVX instruction, and is translated one
+  instruction at a time (no regions), because a JIT rewrites its code in
+  place and only the trapping instruction's bytes are checked.
 - Unloading the module makes every process that was using it die with SIGILL.
 
 ## Testing
@@ -357,5 +359,6 @@ and extra arguments are passed to `insmod` (e.g. `./run.sh patch=0`).
 | Floating point only where MXCSR is saved (`helpers/check_fp.sh`, on every blob build) | development machine | passes; fails with either rule mutated |
 | Shorter inline `vptest`/`vtestps/pd` (20 -> 13), variable shifts (46 -> 38, 18 -> 14), `vpermd`/`vpermps` (33 -> 25), `vpcmpgtq` (24 -> 22), `vpbroadcastb` (5 -> 3) | development machine (differential test, all modes; previous build's state dumps; a planted bug in each caught), QEMU both CPU models (`fakeavx-prof --check` 198/198, `vpermd` dumps under the module) | 0 mismatches, identical |
 | `popcnt` inline (36 -> 23 instructions, no call) and legacy `pcmpgtq` inline (C helper -> 9 instructions) | development machine (differential test all modes incl. 24,000 `popcnt`/SSE4.2 cases, zero inputs for ZF; previous build's state dumps; 9 planted bugs caught), QEMU both CPU models (`fakeavx-prof --check` 198/198, `evict_test`, `unpatched_test`, end-to-end) | 0 mismatches, identical |
+| JIT code rewritten in place (`tests/guest/jit_test`: the instruction after an AVX one, a second AVX instruction, a later immediate) | QEMU, both CPU models | pass; the previous module ran the old code in all 3 cases |
 | `scripts/install.sh` (DKMS, systemd units) | — | **not run**: only the file layout was checked |
 | Automatic mode, SSSE3 support | real hardware | **not yet run** |
