@@ -41,7 +41,7 @@ typedef int64_t s64;
 
 /* Helper blob entry points (offsets from blob base). */
 #define FA_BLOB_HELPER	0x00
-#define FA_BLOB_POPCNT	0x08
+#define FA_BLOB_POPCNT	0x08	/* unused: popcnt is translated inline */
 #define FA_BLOB_CRC32	0x10
 #define FA_BLOB_HELPER_LEAN 0x18	/* integer helpers: no xmm register saved */
 /* constants for inline translations (16 bytes each, 16-byte aligned) */
@@ -52,6 +52,7 @@ typedef int64_t s64;
 #define FA_BLOB_LOQ	0x60	/* low qword all ones, high qword zero */
 #define FA_BLOB_ZERO	0x70	/* zero */
 #define FA_BLOB_BCASTW	0x80	/* 0,1 in every word: pshufb broadcasting word 0 */
+#define FA_BLOB_POPC	0x90	/* popcnt: 0x55.., 0x33.., 0x0f.., 0x01.. (qwords), 0x4000 */
 
 #define FA_MAX_STUB	512	/* upper bound for one translated instruction */
 

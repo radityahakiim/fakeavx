@@ -26,7 +26,7 @@ touched at all.
 | Path | What |
 |---|---|
 | `core/` | Decoders, instruction table, AVX→SSE translator and region builder. Plain C, no OS dependencies. |
-| `helpers/` | User-mode helper blob (gathers, variable shifts, permutes, masked moves, POPCNT). Mapped into each process. |
+| `helpers/` | User-mode helper blob (gathers, masked moves, `pcmpXstrX`, `crc32`, constants for inline sequences). Mapped into each process. |
 | `kmod/` | The kernel module. |
 | `tools/fakeavx-cpuid` | Lists, saves and restores the known `cpuid` sites; manual registration. |
 | `scripts/` | Permanent installation: `install.sh`, `uninstall.sh`, systemd units. |
@@ -356,5 +356,6 @@ and extra arguments are passed to `insmod` (e.g. `./run.sh patch=0`).
 | Eviction undone for an AVX instruction that had its own jump (`tests/evict_test`) | QEMU, both CPU models | 16 traps, then 0 in 2000 direct entries (previous module: 2000 and 2000) |
 | Floating point only where MXCSR is saved (`helpers/check_fp.sh`, on every blob build) | development machine | passes; fails with either rule mutated |
 | Shorter inline `vptest`/`vtestps/pd` (20 -> 13), variable shifts (46 -> 38, 18 -> 14), `vpermd`/`vpermps` (33 -> 25), `vpcmpgtq` (24 -> 22), `vpbroadcastb` (5 -> 3) | development machine (differential test, all modes; previous build's state dumps; a planted bug in each caught), QEMU both CPU models (`fakeavx-prof --check` 198/198, `vpermd` dumps under the module) | 0 mismatches, identical |
+| `popcnt` inline (36 -> 23 instructions, no call) and legacy `pcmpgtq` inline (C helper -> 9 instructions) | development machine (differential test all modes incl. 24,000 `popcnt`/SSE4.2 cases, zero inputs for ZF; previous build's state dumps; 9 planted bugs caught), QEMU both CPU models (`fakeavx-prof --check` 198/198, `evict_test`, `unpatched_test`, end-to-end) | 0 mismatches, identical |
 | `scripts/install.sh` (DKMS, systemd units) | — | **not run**: only the file layout was checked |
 | Automatic mode, SSSE3 support | real hardware | **not yet run** |

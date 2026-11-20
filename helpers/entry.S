@@ -11,7 +11,7 @@
 _start:
 	jmp	helper_entry		/* FA_BLOB_HELPER */
 	.balign	8
-	jmp	popcnt_entry		/* FA_BLOB_POPCNT */
+	ud2				/* FA_BLOB_POPCNT: unused, popcnt is inline */
 	.balign	8
 	jmp	crc32_entry		/* FA_BLOB_CRC32 */
 	.balign	8
@@ -46,6 +46,11 @@ zero16:			/* pshufb: byte 0 everywhere (vpbroadcastb) */
 	.org	FA_BLOB_BCASTW
 bcast_w:		/* pshufb: word 0 everywhere (vpbroadcastw) */
 	.byte	0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1
+	.org	FA_BLOB_POPC
+popc:			/* popcnt (do_popcnt): the bit-count masks, and ZF for sahf */
+	.quad	0x5555555555555555, 0x3333333333333333
+	.quad	0x0f0f0f0f0f0f0f0f, 0x0101010101010101
+	.long	0x4000
 
 /*
  * In:  rdi = descriptor (struct fa_insn), [rsp] = return, [rsp+8] = guest rdi,
@@ -138,44 +143,6 @@ helper_entry:
 	HELPER_ENTRY fa_helper_c, 1
 helper_lean_entry:
 	HELPER_ENTRY fa_helper_lean_c, 0
-
-/*
- * In: rax = value (zero-extended). Out: rax = population count, EFLAGS exactly
- * as POPCNT leaves them (ZF = source was zero, CF/OF/SF/AF/PF clear).
- */
-popcnt_entry:
-	push	%rcx
-	push	%rdx
-	mov	%rax, %rdx
-	shr	%rdx
-	movabs	$0x5555555555555555, %rcx
-	and	%rcx, %rdx
-	sub	%rdx, %rax
-	movabs	$0x3333333333333333, %rcx
-	mov	%rax, %rdx
-	shr	$2, %rdx
-	and	%rcx, %rax
-	and	%rcx, %rdx
-	add	%rdx, %rax
-	mov	%rax, %rdx
-	shr	$4, %rdx
-	add	%rdx, %rax
-	movabs	$0x0f0f0f0f0f0f0f0f, %rcx
-	and	%rcx, %rax
-	movabs	$0x0101010101010101, %rcx
-	imul	%rcx, %rax
-	shr	$56, %rax
-	mov	%rax, %rdx
-	xor	%eax, %eax
-	test	%rdx, %rdx
-	sete	%al
-	shl	$14, %eax		/* AH = ZF image */
-	test	%eax, %eax		/* clear OF */
-	sahf
-	mov	%rdx, %rax
-	pop	%rdx
-	pop	%rcx
-	ret
 
 /*
  * CRC32C of the low ecx bytes of rdx (1, 2, 4 or 8), continuing from eax.

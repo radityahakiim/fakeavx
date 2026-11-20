@@ -1283,22 +1283,60 @@ static int do_gather(struct ctx *c)
 	return 1;
 }
 
+/*
+ * popcnt, inline: the 64-bit bit count (the 32- and 16-bit forms count a
+ * zero-extended value, which is the same) in rax with one scratch gpr g,
+ * the masks read from the blob (FA_BLOB_POPC). Then the flags: popcnt sets
+ * ZF if the source was 0 and clears CF OF SF AF PF. No arithmetic result
+ * can do that (a zero result sets PF), so they come from sahf: g = count - 1
+ * is all ones only for a zero count, & 0x4000 leaves ZF's bit for ah; or-ing
+ * it into eax (count < 256) also clears OF, which sahf leaves alone; then
+ * movzbl drops it again without touching the flags.
+ */
+static void alu_blob(struct ctx *c, int opc, int r, int off, int w)
+{
+	emit(c, 0, opc == 0xaf ? 1 : 0, opc, r, BLOB(FA_BLOB_POPC + off), w, -1);
+}
+
 static void do_popcnt(struct ctx *c)
 {
 	const struct fa_insn *in = c->in;
-	int D = in->reg;
+	int D = in->reg, g, save = (D != 0) || in->opsize16;
 	struct opnd src = is_mem(c) ? MEM(0) : REG(in->rm);
-	int save = (D != 0) || in->opsize16;
+	struct fa_mem m = c->mem;
 
 	if (save)
 		gpr_gs(c, 1, 0, 0);
+	g = gscratch(c, (1 << D) | 1);
 	if (in->opsize16)
 		emit(c, 0, 1, 0xb7, 0, src, 0, -1);		/* movzx eax, r/m16 */
 	else
 		emit(c, 0, 0, 0x8b, 0, src, in->W, -1);		/* mov (r|e)ax, r/m */
-	put(c, 0x48); put(c, 0x8d); put(c, 0x64); put(c, 0x24); put(c, 0x80);
-	emit_call_blob(c, FA_BLOB_POPCNT);
-	put(c, 0x48); put(c, 0x8d); put(c, 0xa4); put(c, 0x24); put32(c, 128);
+	emit(c, 0, 0, 0x89, 0, REG(g), 1, -1);		/* mov %rax, g */
+	emit(c, 0, 0, 0xc1, 5, REG(g), 1, 1);		/* shr $1, g */
+	alu_blob(c, 0x23, g, 0, 1);			/* and 0x55.., g */
+	emit(c, 0, 0, 0x29, g, REG(0), 1, -1);		/* sub g, %rax */
+	emit(c, 0, 0, 0x89, 0, REG(g), 1, -1);		/* mov %rax, g */
+	emit(c, 0, 0, 0xc1, 5, REG(g), 1, 2);		/* shr $2, g */
+	alu_blob(c, 0x23, 0, 8, 1);			/* and 0x33.., %rax */
+	alu_blob(c, 0x23, g, 8, 1);			/* and 0x33.., g */
+	emit(c, 0, 0, 0x01, g, REG(0), 1, -1);		/* add g, %rax */
+	emit(c, 0, 0, 0x89, 0, REG(g), 1, -1);		/* mov %rax, g */
+	emit(c, 0, 0, 0xc1, 5, REG(g), 1, 4);		/* shr $4, g */
+	emit(c, 0, 0, 0x01, g, REG(0), 1, -1);		/* add g, %rax */
+	alu_blob(c, 0x23, 0, 16, 1);			/* and 0x0f.., %rax */
+	alu_blob(c, 0xaf, 0, 24, 1);			/* imul 0x01.., %rax */
+	emit(c, 0, 0, 0xc1, 5, REG(0), 1, 56);		/* shr $56, %rax */
+	/* flags */
+	memset(&c->mem, 0, sizeof(c->mem));
+	c->mem.has_base = 1;
+	c->mem.disp = -1;
+	emit(c, 0, 0, 0x8d, g, MEM(0), 0, -1);		/* lea -1(%rax), g32 */
+	c->mem = m;
+	alu_blob(c, 0x23, g, 32, 0);			/* and 0x4000, g32 */
+	emit(c, 0, 0, 0x09, g, REG(0), 0, -1);		/* or g32, %eax: OF = 0 */
+	put(c, 0x9e);					/* sahf */
+	emit(c, 0, 1, 0xb6, 0, REG(0), 0, -1);		/* movzbl %al, %eax */
 	if (D != 0) {
 		/* mov D, (r|e)ax ; restore rax */
 		emit(c, in->opsize16 ? 0x66 : 0, 0, 0x89, 0, REG(D), in->W, -1);
@@ -1452,6 +1490,35 @@ static void lane_out(struct ctx *c, int T, int l)
  * b is used where it is (register, or its upper half's slot or register);
  * only from guest memory, which may be unaligned, is it copied first.
  */
+/*
+ * Legacy pcmpgtq (SSE4.2): the same as vpcmpgtq for one lane, but the
+ * destination is also a, and is written directly at the end (a is no longer
+ * needed by then). A memory operand is read once, with an aligned load, so a
+ * misaligned one still faults as the real instruction does. The upper half
+ * of the register is left alone, as legacy SSE does.
+ */
+static void do_pcmpgtq_legacy(struct ctx *c)
+{
+	int A = c->in->reg, T1 = xscratch(c), T2 = xscratch(c);
+	struct opnd b = REG(c->in->rm);
+
+	if (is_mem(c)) {
+		int T3 = xscratch(c);
+
+		emit(c, 0, 1, 0x28, T3, MEM(0), 0, -1);	/* movaps: aligned, faults if not */
+		b = REG(T3);
+	}
+	load_gs(c, T1, b);
+	sse2(c, 0xfb, T1, REG(A), -1);		/* psubq: b - a */
+	mov_rr(c, T2, A);
+	sse2(c, 0xef, T2, b, -1);		/* pxor: a ^ b */
+	sse2(c, 0xdf, T2, REG(T1), -1);		/* pandn: ~(a ^ b) & (b - a) */
+	sse2(c, 0xdf, A, b, -1);		/* pandn: ~a & b, into the destination */
+	sse2(c, 0xeb, A, REG(T2), -1);		/* por */
+	sse2(c, 0x72, 4, REG(A), 31);		/* psrad $31 */
+	sse2(c, 0x70, A, REG(A), 0xf5);		/* pshufd: high dword to both */
+}
+
 static void do_pcmpgtq(struct ctx *c)
 {
 	int A = c->in->vvvv, l, T1 = xscratch(c), T2 = xscratch(c), T3 = -1;
@@ -1688,6 +1755,8 @@ static int inline_kind(const struct fa_insn *in, int no_sse41)
 
 int fa_scratch_needed(const struct fa_insn *in, int no_sse41)
 {
+	if (in->kind == FA_K_SSE4 && in->map == 2 && in->opcode == 0x37 && in->mod != 3)
+		return 3;	/* legacy pcmpgtq from memory: the operand in its own register */
 	return inline_kind(in, no_sse41) ? 3 : 2;
 }
 
@@ -1738,6 +1807,15 @@ int fa_translate(const struct fa_insn *in, const struct fa_env *env)
 			finish(c);
 		} else if (!env->no_sse41 && fa_is_sse41(in->map, in->opcode)) {
 			do_native(c);
+			finish(c);
+		} else if (in->map == 2 && in->opcode == 0x37 && in->pp == 1) {
+			c->used = 1 << in->reg;
+			if (in->mod == 3)
+				c->used |= 1 << in->rm;
+			if (env->map)
+				c->used |= env->map->reserved;
+			fix_riprel(c, 0);
+			do_pcmpgtq_legacy(c);
 			finish(c);
 		} else {
 			do_helper(c);

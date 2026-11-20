@@ -575,3 +575,21 @@ The blob constants are placed with `.org` at their fakeavx.h offsets, so a
 mismatch fails the build. Not changed: `vpmovmskb ymm` (its six `lea` could be
 `xchg %ch,%cl` + `bswap`, but the byte-register write stalls on Core 2) and
 `vzeroupper` (16 stores of the upper halves, already minimal).
+
+**popcnt and legacy pcmpgtq inline.** These are the emulated instructions
+Bun and Claude Code contain most often (1,661 / 2,338 `popcnt` sites, 436 /
+533 `pcmpgtq`; SSE4.1 runs natively on Penryn), so their cost was cut with
+results unchanged:
+- `popcnt` no longer calls a blob routine: the stub computes the count
+  itself (the SWAR bit count, with its four masks as blob memory operands
+  instead of `movabs` loads, in rax and one scratch register), then the
+  flags. popcnt sets ZF for a zero source and clears CF OF SF AF PF; no
+  arithmetic result gives that (a zero result sets PF), so they still come
+  from `sahf`, but from a shorter route: `lea -1(%rax)` is all ones only for a
+  zero count, `and 0x4000` leaves ZF's bit for ah, `or` puts it there and
+  clears OF, `sahf`, and `movzbl %al` drops it again without touching the
+  flags. 36 instructions executed (stub, call, routine with push/pop) -> 23.
+- Legacy `pcmpgtq` went through the C helper; now it uses the SSE2 sequence
+  of `vpcmpgtq` for one lane, writing the destination directly once `a` is
+  no longer needed: 9 instructions. A memory operand is read once with
+  `movaps`, so a misaligned one still faults like the real instruction.
