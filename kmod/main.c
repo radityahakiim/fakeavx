@@ -101,10 +101,13 @@ module_param(stat_diverted, ulong, 0444);
 /*
  * Where first executions spend their time (nanoseconds, summed): the whole
  * slow path, building translations, mapping code cache, writing guest and
- * cache memory, and the serializing IPIs between patch steps.
+ * cache memory, the serializing IPIs between patch steps, and looking for
+ * cpuid instructions in a newly seen file.
  */
 static unsigned long stat_ns_slow, stat_ns_build, stat_ns_map, stat_ns_poke, stat_ns_sync,
-	stat_syncs, stat_pokes, stat_syncs_skipped, stat_ns_warm, stat_warmed, stat_warm_stale;
+	stat_syncs, stat_pokes, stat_syncs_skipped, stat_ns_warm, stat_warmed, stat_warm_stale,
+	stat_ns_scan;
+module_param(stat_ns_scan, ulong, 0444);
 module_param(stat_syncs_skipped, ulong, 0444);
 module_param(stat_ns_warm, ulong, 0444);
 module_param(stat_warmed, ulong, 0444);
@@ -1725,7 +1728,14 @@ static void fa_slow(struct pt_regs *regs)
 	/* which binary is this, and does CPUID need answering for it? */
 	n = fa_read_insn(ip, buf);
 	if (n && !fa_decode(buf, n, ip, &in) && in.kind != FA_K_XGETBV)
-		fa_note_file(ip, in.kind == FA_K_VEX);
+		/*
+		 * AVX code in a process told AVX is there (FAKEAVX=avx2) says
+		 * nothing about the file: that is what it was told to choose.
+		 * Marking the file would make CPUID report AVX to every later
+		 * run, and its JIT (Bun, Claude Code) then writes AVX code
+		 * that traps on every execution.
+		 */
+		fa_note_file(ip, in.kind == FA_K_VEX && fm->cpuid_mode != 2);
 
 	mutex_lock(&fm->lock);
 	n = fa_read_insn(ip, buf);
@@ -2256,43 +2266,43 @@ static void fa_sites_clear(void)
 	mutex_unlock(&fa_sites_lock);
 }
 
-/* Walk [start, end) of the file one instruction at a time. fa_sites_lock held. */
+static int fa_scan_hit(void *ctx, u64 off)
+{
+	return fa_site_add(ctx, off);
+}
+
+/*
+ * The cpuid instructions in [start, end) of the file (core/scan.c), read a
+ * megabyte at a time with the bytes the check needs on either side.
+ * fa_sites_lock held.
+ */
 static int fa_scan_range(struct fa_file *ff, struct file *file, loff_t start, loff_t end)
 {
-	const size_t chunk = 1 << 20;
-	u8 *buf = kvmalloc(chunk, GFP_KERNEL);
-	loff_t o = start;
+	const size_t chunk = 1 << 20, cap = chunk + FA_SCAN_BACK + 16;
+	struct fa_scan s = {
+		.seg_start = start, .done = start, .hit = fa_scan_hit, .ctx = ff,
+	};
+	u8 *buf = kvmalloc(cap, GFP_KERNEL);
+	loff_t from;
 	int ret = 0;
 
 	if (!buf)
 		return -ENOMEM;
-	while (o < end && !ret) {
-		loff_t pos = o;
-		ssize_t have = kernel_read(file, buf, min_t(loff_t, chunk, end - o), &pos);
-		bool last = o + have >= end;
-		ssize_t i = 0;
+	s.buf = buf;
+	for (from = start; from < end && !ret; from += chunk) {
+		loff_t to = min_t(loff_t, from + chunk, end);
+		loff_t lo = max_t(loff_t, from - FA_SCAN_BACK, start), pos = lo;
+		size_t want = min_t(loff_t, to + 16, end) - lo;
+		ssize_t have = kernel_read(file, buf, want, &pos);
 
-		if (have <= 0) {
-			ret = have ? have : -EIO;
+		if (have != (ssize_t)want) {
+			ret = have < 0 ? have : -EIO;
 			break;
 		}
-		/* stop 15 bytes short of the chunk so no instruction is cut off */
-		while (i < have && (last || i + 15 <= have)) {
-			int l = fa_insn_len(buf + i, min_t(ssize_t, 15, have - i));
-
-			if (!l)
-				break;
-			if (l == 2 && buf[i] == 0x0f && buf[i + 1] == 0xa2) {
-				ret = fa_site_add(ff, o + i);
-				if (ret)
-					break;
-			}
-			i += l;
-		}
-		if (!i)
-			break;		/* truncated tail */
-		o += i;
-		if (fatal_signal_pending(current))
+		s.base = lo;
+		s.n = have;
+		ret = fa_scan_cpuid(&s, from, to);
+		if (!ret && fatal_signal_pending(current))
 			ret = -EINTR;
 		cond_resched();
 	}
@@ -2359,8 +2369,10 @@ static void fa_note_file(unsigned long ip, bool vex)
 			pr_info("%s uses AVX; CPUID will say so to it\n", ff->path);
 		}
 		if (autocpuid && !ff->scanned) {
+			u64 t = ktime_get_ns();
 			int ret = fa_scan_file(ff, file);
 
+			stat_ns_scan += ktime_get_ns() - t;
 			if (ret != -EINTR)
 				ff->scanned = true;
 			stat_scans++;

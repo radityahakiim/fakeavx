@@ -37,6 +37,7 @@ touched at all.
 | `tests/intdec_check.py` | Checks the integer-instruction decoder against Capstone. |
 | `tests/ssedec_check.py` | Checks the legacy SSE/MMX decoder (instructions regions copy as they are) against Capstone, including implicit register use. |
 | `tests/divert_check.c` | Checks where `fa_find_divert()` decides an instruction starts against objdump's disassembly of a whole executable (`make -C tests divert-check BIN=...`). |
+| `tests/scan_check.c` | The module's `cpuid` scan against a full instruction-by-instruction walk of whole ELF files (`make -C tests scan-check FILES=...`; part of `make check`). |
 | `tests/fuzz.c` | ASan/UBSan fuzz of decoders, translator and region builder. |
 | `tests/guest/` | End-to-end test program to run on the AVX-less machine. |
 | `tests/qemu/run.sh` | Boots a kernel in QEMU with a Penryn CPU model and runs the end-to-end test. |
@@ -108,7 +109,7 @@ Module parameters (`/etc/modprobe.d/fakeavx.conf`, or
 | `warm` | 1 | Translate all of a file's known sites at once, the first time a process traps in it (below). |
 | `evict` | 1 | When a 3-4 byte instruction's jump window is unusable, rewrite the first byte(s) of the next instruction (one the same region translates or carries) to move the window (below). |
 | `autocpuid` | 1 | Find a binary's `cpuid` instructions automatically (below). |
-| `stat_*` | — | Read-only counters, e.g. `stat_slow` (first-time traps), `stat_fast` (repeat traps), `stat_regions`, `stat_patched`, `stat_cpuid`, `stat_scans`, `stat_unsupported`, `stat_short_refused` (3-4 byte instructions left trapping because their stub window was unavailable), `stat_unpatched` (all instructions left trapping, for any reason), `stat_diverted` (of those, how many were then diverted at the instruction before), `stat_evicted` (short instructions patched by rewriting the next one; `stat_evicted_int`: of them, where the next one is an integer instruction), `stat_evict_traps` (direct jumps into such a rewritten instruction, each a trap), `stat_evict_undone` (evictions undone after 16 such jumps: integer instructions given their bytes back, and AVX instructions their own jump), `stat_warmed` (sites translated by warm-up), `stat_warm_stale` (warm-up sites dropped because their file changed), and where first executions spend their time: `stat_ns_slow` (all of the slow path), `stat_ns_warm`, `stat_ns_build` (building translations), `stat_ns_map`, `stat_ns_poke` (`stat_pokes` writes), `stat_ns_sync` (`stat_syncs` IPI rounds; `stat_syncs_skipped`: not needed, single-threaded process). |
+| `stat_*` | — | Read-only counters, e.g. `stat_slow` (first-time traps), `stat_fast` (repeat traps), `stat_regions`, `stat_patched`, `stat_cpuid`, `stat_scans`, `stat_unsupported`, `stat_short_refused` (3-4 byte instructions left trapping because their stub window was unavailable), `stat_unpatched` (all instructions left trapping, for any reason), `stat_diverted` (of those, how many were then diverted at the instruction before), `stat_evicted` (short instructions patched by rewriting the next one; `stat_evicted_int`: of them, where the next one is an integer instruction), `stat_evict_traps` (direct jumps into such a rewritten instruction, each a trap), `stat_evict_undone` (evictions undone after 16 such jumps: integer instructions given their bytes back, and AVX instructions their own jump), `stat_warmed` (sites translated by warm-up), `stat_warm_stale` (warm-up sites dropped because their file changed), and where first executions spend their time: `stat_ns_slow` (all of the slow path), `stat_ns_scan` (looking for `cpuid` instructions, part of it), `stat_ns_warm`, `stat_ns_build` (building translations), `stat_ns_map`, `stat_ns_poke` (`stat_pokes` writes), `stat_ns_sync` (`stat_syncs` IPI rounds; `stat_syncs_skipped`: not needed, single-threaded process). |
 
 `stat_fast` is the number to watch: every count is a full kernel round trip.
 If it keeps climbing while a program runs, that program has hot instructions
@@ -156,8 +157,9 @@ trapped on a Core 2. The module therefore puts a probe on the `cpuid`
 instructions of the binaries that matter and answers in the CPU's place.
 
 This is automatic. The first time a binary executes an unsupported
-instruction, the module walks that file's code, finds its `cpuid`
-instructions (a few seconds for a 100 MB executable, once) and from then on
+instruction, the module looks through that file's code for its `cpuid`
+instructions (once per file; 31 ms for Claude Code's 113 MB of code in a VM on a
+recent CPU, more on a Core 2) and from then on
 answers them — for every process running that file, now and later. With the
 permanent installation the list survives reboots; a file that has changed
 since (an update) is simply scanned again.
@@ -169,7 +171,13 @@ What CPUID is made to report:
   instructions (it uses AVX whatever CPUID says), or with `FAKEAVX=avx2`. A
   program that can choose is faster on its own SSE code than on translated
   AVX, and AVX2 code paths in the wild usually also use BMI/FMA/LZCNT, which
-  are not emulated.
+  are not emulated. AVX that a `FAKEAVX=avx2` process executes does not mark
+  its file: that process was told AVX is there. (Before this rule, one such
+  run of Claude Code marked it for good, and from then on its JavaScript JIT
+  wrote AVX code, which traps on every execution: about 300,000 traps per
+  start in a VM. `fakeavx-cpuid list` shows a mark as "reports AVX";
+  `fakeavx-cpuid clear` forgets it along with everything else, which the
+  module then learns again.)
 
 Limits of the automatic way:
 
@@ -362,6 +370,7 @@ and extra arguments are passed to `insmod` (e.g. `./run.sh patch=0`).
 | End-to-end, region version | ThinkPad T61 | pass, `stat_fast` 0, 183 ms, 6 of 11 regions borrowing |
 | Differential test in SSSE3-host mode, and legacy SSE4.1 encodings | development machine | 0 mismatches |
 | In-kernel `cpuid` scanner vs. objdump (5 binaries incl. Bun, Claude Code) | development machine | identical site lists |
+| `cpuid` scan from the candidate bytes (`tests/scan_check.c`) vs. a full walk: 3,781 ELF files of a Linux system, Claude Code 2.1.328-330, Bun, Node; in the module vs. objdump on Claude Code 2.1.330 | development machine; QEMU TCG | identical (also with a 64-byte window); Claude Code 417 → 31 ms in a KVM guest |
 | End-to-end on an SSSE3-only CPU model (`-cpu core2duo`) | QEMU | pass |
 | Automatic mode, automatic CPUID discovery, cache save/restore | QEMU, both CPU models | pass |
 | Bun and Claude Code (version before automatic mode) | ThinkPad T61 P8600 | reported working |

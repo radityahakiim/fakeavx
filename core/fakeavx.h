@@ -224,6 +224,26 @@ int fa_emit_entry(u8 *out, u64 at, const struct fa_regmap *map, u64 target);
 /* Length of the instruction at p (lendec.c): 1 for an invalid opcode, 0 if truncated. */
 int fa_insn_len(const u8 *p, u32 avail);
 
+/*
+ * scan.c: the cpuid instructions of an executable segment [seg_start,
+ * seg_end), as a linear sweep from seg_start finds them. The caller hands
+ * in the segment piece by piece: for the candidates in [from, to), buf must
+ * hold the bytes [base, base + n) with base <= max(from - FA_SCAN_BACK,
+ * seg_start) and base + n >= min(to + 16, seg_end). done carries over from
+ * one piece to the next (start with seg_start). hit() is called with the
+ * offset of each cpuid; a nonzero return stops the scan and is returned.
+ */
+#define FA_SCAN_BACK	4096
+struct fa_scan {
+	const u8 *buf;
+	u64 base, seg_start, done;
+	u32 n;
+	int (*hit)(void *ctx, u64 off);
+	void *ctx;
+};
+int fa_scan_cpuid(struct fa_scan *s, u64 from, u64 to);
+int fa_sweep_len(const u8 *p, u32 avail);	/* sweep step; 0 only at the end of the data */
+
 /* divert.c: where to divert ahead of an instruction that cannot be patched */
 #define FA_DV_BACK	64	/* how far before it the diversion point may be */
 enum {

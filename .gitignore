@@ -21,6 +21,7 @@
 /tests/difftest
 /tests/fuzz
 /tests/regtest
+/tests/scan_check
 /tests/guest/guest_test
 /tests/guest/cpuid_test
 /tests/guest/unpatched_test

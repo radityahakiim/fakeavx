@@ -6,6 +6,10 @@
 #       ./run-app.sh /path/to/binary 'guest command line'
 #
 # The binary is copied to /app in the guest together with the host's glibc.
+#
+# ACCEL=kvm runs it on the real CPU instead of TCG (needs /dev/kvm and a QEMU
+# built with KVM): real timings, but there POPCNT and SSE4.x run natively, so
+# only AVX traps, and each trap costs more than on bare metal.
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
 top=$here/../..
@@ -60,6 +64,6 @@ INIT
 chmod +x "$work/root/init"
 (cd "$work/root" && find . | cpio -o -H newc 2>/dev/null | gzip -1) > "$work/initrd.gz"
 
-"$QEMU" -accel tcg -cpu "${CPU:-Penryn}" -smp "${SMP:-2}" -m "${MEM:-3072}" -nographic -no-reboot \
+"$QEMU" -accel "${ACCEL:-tcg}" -cpu "${CPU:-Penryn}" -smp "${SMP:-2}" -m "${MEM:-3072}" -nographic -no-reboot \
 	-nic none -kernel "$KERNEL" -initrd "$work/initrd.gz" \
 	-append "console=ttyS0 panic=-1 loglevel=4 ${CMDLINE:-}"

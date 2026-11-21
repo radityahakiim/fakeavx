@@ -5,6 +5,10 @@
 #   KERNEL=/path/to/bzImage QEMU=/path/to/qemu-system-x86_64 ./run.sh [module params]
 #
 # The module must have been built against the same kernel (make -C kmod KDIR=...).
+#
+# ACCEL=kvm runs it on the real CPU instead of TCG (needs /dev/kvm and a QEMU
+# built with KVM): real timings, but there POPCNT and SSE4.x run natively, so
+# only AVX traps, and each trap costs more than on bare metal.
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
 top=$here/../..
@@ -46,6 +50,6 @@ INIT
 chmod +x "$work/root/init"
 (cd "$work/root" && find . | cpio -o -H newc 2>/dev/null | gzip -1) > "$work/initrd.gz"
 
-"$QEMU" -accel tcg -cpu "$CPU" -smp "$SMP" -m 512 -nographic -no-reboot \
+"$QEMU" -accel "${ACCEL:-tcg}" -cpu "$CPU" -smp "$SMP" -m 512 -nographic -no-reboot \
 	-kernel "$KERNEL" -initrd "$work/initrd.gz" \
 	-append "console=ttyS0 panic=-1 quiet loglevel=4 ${CMDLINE:-}"

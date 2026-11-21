@@ -432,12 +432,26 @@ the temporary trapping byte.
 handler runs in sleepable context and that changing `regs->ip` makes the
 kernel skip the probed instruction. Sites are found by the module itself: the
 #UD slow path notes which file the instruction belongs to and, once per file,
-walks its executable ELF segments with `core/lendec.c` (a length-only decoder;
-the kernel's `insn_decode()` is not exported). Its site lists are identical to
-objdump's on the binaries tried. `/proc/fakeavx/sites` exports the state in
+finds the `cpuid` instructions in its executable ELF segments (`core/scan.c`,
+with `core/lendec.c`, a length-only decoder; the kernel's `insn_decode()` is
+not exported). The answer is what a linear sweep from the segment start
+finds, as objdump does, but the module does not decode everything: it looks
+for the bytes `0f a2` (208 places in Claude Code's 113 MB of code, 153 of
+them real), and redoes the sweep only from 4 KB before each, or from where
+the previous one ended. x86 code resynchronizes within a few instructions;
+`tests/scan_check.c` compares both on whole files (3,781 files of a Linux
+system: identical, even with a 64-byte window), and the module's list for
+Claude Code equals objdump's. In a KVM guest that took Claude Code's scan
+from 417 to 31 ms. A run of 15 or more prefixes (data in the code) counts as
+one invalid byte, as in objdump; the full walk used to stop there, skipping
+the rest of the segment (7 sites in an NVIDIA library). `/proc/fakeavx/sites` exports the state in
 the same line format the `cpuid_site` parameter accepts, which is all the
 persistence there is: a systemd unit saves it and writes it back at boot.
-AVX is reported only to files seen executing VEX-encoded instructions.
+AVX is reported only to files seen executing VEX-encoded instructions, and
+not when that process was started with `FAKEAVX=avx2`: there AVX was its
+answer, not its requirement, and a mark would make every later run's JIT
+(JavaScriptCore in Bun and Claude Code) write AVX code into memory that is
+never patched, so that it traps on every execution.
 
 **Short-patch windows and the heap (found with fakeavx-prof on the T61).**
 A 3-4 byte instruction's stub must sit in a window fixed by the bytes after
