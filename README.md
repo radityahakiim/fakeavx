@@ -105,9 +105,10 @@ Module parameters (`/etc/modprobe.d/fakeavx.conf`, or
 | `policy` | 1 | 1: every process unless it has `FAKEAVX=0`. 0: only processes started with `FAKEAVX=1`. |
 | `patch` | 1 | Overwrite translated instructions with a jump. 0 traps on every execution (slow; for debugging). |
 | `divert` | 1 | When an instruction that could not be patched keeps trapping, patch the instruction before it instead (below). |
+| `warm` | 1 | Translate all of a file's known sites at once, the first time a process traps in it (below). |
 | `evict` | 1 | When a 3-4 byte instruction's jump window is unusable, rewrite the first byte(s) of the next instruction (one the same region translates or carries) to move the window (below). |
 | `autocpuid` | 1 | Find a binary's `cpuid` instructions automatically (below). |
-| `stat_*` | — | Read-only counters, e.g. `stat_slow` (first-time traps), `stat_fast` (repeat traps), `stat_regions`, `stat_patched`, `stat_cpuid`, `stat_scans`, `stat_unsupported`, `stat_short_refused` (3-4 byte instructions left trapping because their stub window was unavailable), `stat_unpatched` (all instructions left trapping, for any reason), `stat_diverted` (of those, how many were then diverted at the instruction before), `stat_evicted` (short instructions patched by rewriting the next one; `stat_evicted_int`: of them, where the next one is an integer instruction), `stat_evict_traps` (direct jumps into such a rewritten instruction, each a trap), `stat_evict_undone` (evictions undone after 16 such jumps: integer instructions given their bytes back, and AVX instructions their own jump). |
+| `stat_*` | — | Read-only counters, e.g. `stat_slow` (first-time traps), `stat_fast` (repeat traps), `stat_regions`, `stat_patched`, `stat_cpuid`, `stat_scans`, `stat_unsupported`, `stat_short_refused` (3-4 byte instructions left trapping because their stub window was unavailable), `stat_unpatched` (all instructions left trapping, for any reason), `stat_diverted` (of those, how many were then diverted at the instruction before), `stat_evicted` (short instructions patched by rewriting the next one; `stat_evicted_int`: of them, where the next one is an integer instruction), `stat_evict_traps` (direct jumps into such a rewritten instruction, each a trap), `stat_evict_undone` (evictions undone after 16 such jumps: integer instructions given their bytes back, and AVX instructions their own jump), `stat_warmed` (sites translated by warm-up), `stat_warm_stale` (warm-up sites dropped because their file changed), and where first executions spend their time: `stat_ns_slow` (all of the slow path), `stat_ns_warm`, `stat_ns_build` (building translations), `stat_ns_map`, `stat_ns_poke` (`stat_pokes` writes), `stat_ns_sync` (`stat_syncs` IPI rounds; `stat_syncs_skipped`: not needed, single-threaded process). |
 
 `stat_fast` is the number to watch: every count is a full kernel round trip.
 If it keeps climbing while a program runs, that program has hot instructions
@@ -130,6 +131,23 @@ functions) and uses the answer only if all three agree. Checked against
 objdump over Claude Code, Bun and Node: 23,670 answers, none wrong. In
 Claude Code 2.1.326, 8 of the 10 instructions reported on the T61 qualify;
 the other two follow a `call` or start a block, and still trap.
+
+**Warm-up.** Every instruction a first trap translates is remembered with its
+file and offset, and `fakeavx-cpuid save` (run by `fakeavx-save.timer` and at
+shutdown) keeps the list in `/var/cache/fakeavx/sites` with the cpuid sites.
+After a reboot it is restored, and the first time a process traps in such a
+file, fakeavx translates and patches all of that file's sites at once instead
+of one trap at a time (`fakeavx-cpuid list` shows how many each file has).
+That usually happens before the program starts threads, and patching a
+single-threaded process needs none of the cross-CPU synchronization (IPIs)
+that each patch step otherwise waits for. Only offsets are stored, never
+code, so a damaged or forged cache can cost time but cannot put code into a
+process; the module also drops a file's list if the file is not exactly as
+it was (inode, change time, size), since an offset that is no longer an
+instruction start must never be patched. Measured in QEMU with
+`fakeavx-prof` (960 sites): slow path 327 ms -> 152 ms, first-execution
+traps 2,288 -> 1,329 (the rest are `xgetbv`, emulated on every execution by
+design); emulator timings, so only the proportions mean anything.
 
 ## CPUID
 
@@ -360,5 +378,6 @@ and extra arguments are passed to `insmod` (e.g. `./run.sh patch=0`).
 | Shorter inline `vptest`/`vtestps/pd` (20 -> 13), variable shifts (46 -> 38, 18 -> 14), `vpermd`/`vpermps` (33 -> 25), `vpcmpgtq` (24 -> 22), `vpbroadcastb` (5 -> 3) | development machine (differential test, all modes; previous build's state dumps; a planted bug in each caught), QEMU both CPU models (`fakeavx-prof --check` 198/198, `vpermd` dumps under the module) | 0 mismatches, identical |
 | `popcnt` inline (36 -> 23 instructions, no call) and legacy `pcmpgtq` inline (C helper -> 9 instructions) | development machine (differential test all modes incl. 24,000 `popcnt`/SSE4.2 cases, zero inputs for ZF; previous build's state dumps; 9 planted bugs caught), QEMU both CPU models (`fakeavx-prof --check` 198/198, `evict_test`, `unpatched_test`, end-to-end) | 0 mismatches, identical |
 | JIT code rewritten in place (`tests/guest/jit_test`: the instruction after an AVX one, a second AVX instruction, a later immediate) | QEMU, both CPU models | pass; the previous module ran the old code in all 3 cases |
+| Warm-up (`tests/qemu/warm-test.sh`): cold run, same boot, and after save + module reload + restore; lists of changed files dropped; IPIs still issued once a process has threads | QEMU, both CPU models | 198/198 in every run; 960 / 984 sites warmed; wrong identity and touched file dropped; 24 IPI rounds with a second thread, results right |
 | `scripts/install.sh` (DKMS, systemd units) | — | **not run**: only the file layout was checked |
 | Automatic mode, SSSE3 support | real hardware | **not yet run** |

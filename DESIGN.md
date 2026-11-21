@@ -598,3 +598,29 @@ results unchanged:
   of `vpcmpgtq` for one lane, writing the destination directly once `a` is
   no longer needed: 9 instructions. A memory operand is read once with
   `movaps`, so a misaligned one still faults like the real instruction.
+
+**Warm-up instead of a translation cache.** A cache of translated code that
+survives reboots was considered and rejected: translations hold absolute
+addresses, depend on where the heap and the code cache landed, and above
+all, a file of machine code that the module loads into processes would let
+whoever can write it run code in every handled program. Timing counters in
+the slow path (`stat_ns_*`) showed where first executions spend their time
+instead (QEMU, end-to-end test): 43% in the IPIs that serialize every CPU
+between patch steps (about 30 per first trap, one region patches many
+entries), 15% building translations, 8% writing memory. So:
+- IPIs are skipped while the process has one user of its address space
+  (`mm_users == 1`): its patches go to private copies of its pages and to its
+  own code cache, no other CPU runs its code, and its CPU returns to it with
+  iret, which serializes.
+- Each translated first trap is remembered per file (offset, plus the file's
+  inode, change time and size), saved and restored with the cpuid sites by
+  `tools/fakeavx-cpuid`. A process's first trap in a file translates all of
+  its known sites (`fa_warm_up()`), usually before it starts threads, so with
+  no IPIs and no further first traps. Each offset must still decode as an
+  instruction fakeavx translates, and the identity must match exactly: a
+  changed file, or a forged entry, cannot get an offset patched mid-instruction.
+Found while testing it: a trap whose instruction the warm-up had just patched
+returned to the new jump without setting up the thread's state block (the
+stubs use %gs), and the existing "patched in the meantime" exit had the same
+gap; both now set it up. A stale record found after warm-up is never reused
+(tests/guest/jit_test caught that).

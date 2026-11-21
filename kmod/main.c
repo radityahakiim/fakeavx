@@ -73,6 +73,10 @@ static bool divert = true;
 module_param(divert, bool, 0644);
 MODULE_PARM_DESC(divert, "patch the instruction before one that cannot be patched itself, if it keeps trapping (default on)");
 
+static bool warm = true;
+module_param(warm, bool, 0644);
+MODULE_PARM_DESC(warm, "translate a file's known sites all at once at its first trap in a process (default on)");
+
 static bool force;
 module_param(force, bool, 0444);
 MODULE_PARM_DESC(force, "load even if the CPU already supports AVX (for testing only)");
@@ -93,6 +97,25 @@ module_param(stat_unsupported, ulong, 0444);
 module_param(stat_short_refused, ulong, 0444);
 module_param(stat_unpatched, ulong, 0444);
 module_param(stat_diverted, ulong, 0444);
+
+/*
+ * Where first executions spend their time (nanoseconds, summed): the whole
+ * slow path, building translations, mapping code cache, writing guest and
+ * cache memory, and the serializing IPIs between patch steps.
+ */
+static unsigned long stat_ns_slow, stat_ns_build, stat_ns_map, stat_ns_poke, stat_ns_sync,
+	stat_syncs, stat_pokes, stat_syncs_skipped, stat_ns_warm, stat_warmed, stat_warm_stale;
+module_param(stat_syncs_skipped, ulong, 0444);
+module_param(stat_ns_warm, ulong, 0444);
+module_param(stat_warmed, ulong, 0444);
+module_param(stat_warm_stale, ulong, 0444);
+module_param(stat_ns_slow, ulong, 0444);
+module_param(stat_ns_build, ulong, 0444);
+module_param(stat_ns_map, ulong, 0444);
+module_param(stat_ns_poke, ulong, 0444);
+module_param(stat_ns_sync, ulong, 0444);
+module_param(stat_syncs, ulong, 0444);
+module_param(stat_pokes, ulong, 0444);
 module_param(stat_evicted, ulong, 0444);
 module_param(stat_evicted_int, ulong, 0444);
 module_param(stat_evict_traps, ulong, 0444);
@@ -154,6 +177,7 @@ struct fa_mm {
 	unsigned long refill_pending;
 	u8 *buf;			/* FA_BODY_MAX bytes */
 	struct fa_rgn *rg;
+	struct xarray warmed;		/* struct fa_file * -> files warmed up in this process */
 };
 
 static DEFINE_HASHTABLE(fa_mms, 8);
@@ -211,6 +235,7 @@ static void fa_mm_free(struct fa_mm *fm)
 	xa_for_each(&fm->tr, idx, tr)
 		kfree(tr);
 	xa_destroy(&fm->tr);
+	xa_destroy(&fm->warmed);
 	list_for_each_entry_safe(r, rn, &fm->regions, list)
 		kfree(r);
 	list_for_each_entry_safe(p, pn, &fm->pools, list)
@@ -310,6 +335,7 @@ static struct fa_mm *fa_mm_get(struct mm_struct *mm)
 	fm->mm = mm;
 	mutex_init(&fm->lock);
 	xa_init(&fm->tr);
+	xa_init(&fm->warmed);
 	INIT_LIST_HEAD(&fm->regions);
 	INIT_LIST_HEAD(&fm->pools);
 	spin_lock_init(&fm->pool_lock);
@@ -578,6 +604,7 @@ static struct fa_region *fa_region_map_why(struct fa_mm *fm, unsigned long addr,
 {
 	unsigned long flags = MAP_PRIVATE | MAP_ANONYMOUS;
 	struct fa_region *r;
+	u64 t;
 	int w;
 
 	if (fm->nregions >= FA_MAX_REGIONS) {
@@ -600,7 +627,9 @@ static struct fa_region *fa_region_map_why(struct fa_mm *fm, unsigned long addr,
 			*why = FW_NOMEM;
 		return NULL;
 	}
+	t = ktime_get_ns();
 	addr = vm_mmap(NULL, addr, size, PROT_READ | PROT_EXEC, flags, 0);
+	stat_ns_map += ktime_get_ns() - t;
 	if (IS_ERR_VALUE(addr)) {
 		if (why)
 			*why = (long)addr == -EEXIST ? FW_BUSY : FW_NOMEM;
@@ -717,12 +746,39 @@ got:
 
 static int fa_poke(unsigned long addr, const void *buf, int len)
 {
-	return access_process_vm(current, addr, (void *)buf, len,
-				 FOLL_WRITE | FOLL_FORCE) == len ? 0 : -EFAULT;
+	u64 t = ktime_get_ns();
+	int ret = access_process_vm(current, addr, (void *)buf, len,
+				    FOLL_WRITE | FOLL_FORCE) == len ? 0 : -EFAULT;
+
+	stat_ns_poke += ktime_get_ns() - t;
+	stat_pokes++;
+	return ret;
 }
 
 static void fa_nop(void *unused)
 {
+}
+
+/*
+ * Serialize every CPU between the steps of a patch (see fa_patch_site()).
+ * Not needed while the process has a single thread: patches go to its
+ * private copies of the pages and to its own code cache, no other CPU runs
+ * its code, and its own CPU returns to it with iret, which serializes.
+ * (mm_users counts every thread and every temporary user of the mm.)
+ */
+static void fa_sync(void)
+{
+	u64 t;
+
+	if (current->mm && atomic_read(&current->mm->mm_users) == 1) {
+		stat_syncs_skipped++;
+		return;
+	}
+	t = ktime_get_ns();
+
+	on_each_cpu(fa_nop, NULL, 1);
+	stat_ns_sync += ktime_get_ns() - t;
+	stat_syncs++;
 }
 
 /* Only read-only file-backed text is patched: JITs may copy or checksum their code. */
@@ -824,16 +880,16 @@ static int fa_patch_site(struct fa_mm *fm, struct fa_tr *tr, unsigned long ip,
 		if (fa_poke(ip, &b, 1))
 			return FW_POKE;
 		tr->bytes[0] = b;
-		on_each_cpu(fa_nop, NULL, 1);
+		fa_sync();
 	}
 	if (fa_poke(ip + 1, jmp + 1, plen - 1))
 		return FW_POKE;
 	memcpy(tr->bytes + 1, jmp + 1, plen - 1);
-	on_each_cpu(fa_nop, NULL, 1);
+	fa_sync();
 	if (fa_poke(ip, jmp, 1))
 		return FW_POKE;
 	tr->bytes[0] = jmp[0];
-	on_each_cpu(fa_nop, NULL, 1);
+	fa_sync();
 	stat_patched++;
 	if (tr->len < 5)
 		stat_patched_short++;
@@ -957,7 +1013,7 @@ static int fa_ev_poke(struct fa_tr *ntr, unsigned long nip, const u8 *nb, int nf
 		if (fa_poke(nip + k, nb + k, 1))
 			return FW_POKE;
 		ntr->bytes[k] = nb[k];
-		on_each_cpu(fa_nop, NULL, 1);
+		fa_sync();
 	}
 	return FW_OK;
 }
@@ -1051,22 +1107,22 @@ static void fa_ev_undo(struct fa_mm *fm, unsigned long ip, struct fa_tr *tr)
 	if (fa_poke(rec.sip, &c4, 1))
 		return;
 	str->bytes[0] = c4;
-	on_each_cpu(fa_nop, NULL, 1);
+	fa_sync();
 	if (fa_poke(rec.sip + 1, rec.s_orig + 1, rec.slen - 1))
 		return;
 	memcpy(str->bytes + 1, rec.s_orig + 1, rec.slen - 1);
-	on_each_cpu(fa_nop, NULL, 1);
+	fa_sync();
 	for (k = rec.nf - 1; k >= 0; k--) {
 		if (fa_poke(ip + k, rec.n_orig + k, 1))
 			return;
 		tr->bytes[k] = rec.n_orig[k];
-		on_each_cpu(fa_nop, NULL, 1);
+		fa_sync();
 	}
 	tr->evicted = 0;
 	if (fa_poke(rec.sip, rec.s_orig, 1))
 		return;
 	str->bytes[0] = rec.s_orig[0];
-	on_each_cpu(fa_nop, NULL, 1);
+	fa_sync();
 	if (!str->unp)
 		str->unp = fa_report_unpatched(fm, rec.sip, rec.s_orig, rec.slen, FW_EVHOT, 0, 0);
 	stat_evict_undone++;
@@ -1406,7 +1462,7 @@ static struct fa_tr *fa_make_entry(struct fa_mm *fm, struct fa_region *main,
 			while (--nf >= 0)
 				if (ntr->bytes[nf] != old[nf] && !fa_poke(ip + it->len + nf, &old[nf], 1)) {
 					ntr->bytes[nf] = old[nf];
-					on_each_cpu(fa_nop, NULL, 1);
+					fa_sync();
 				}
 			unp = fa_report_unpatched(fm, ip, it->bytes, it->len, why, 0, 0);
 		} else {
@@ -1499,7 +1555,10 @@ static struct fa_tr *fa_translate_region(struct fa_mm *fm, unsigned long ip,
 		rg->max_items = single ? 1 : tries[i].max_items;
 		rg->no_map = tries[i].no_map;
 		rg->no_sse41 = no_sse41;
+		u64 t = ktime_get_ns();
+
 		ret = fa_region_build(rg);
+		stat_ns_build += ktime_get_ns() - t;
 	}
 	if (via && (ret < 0 || !fa_rgn_reaches(rg, ip)))
 		return NULL;
@@ -1635,6 +1694,9 @@ out:
 	return ret;
 }
 
+static bool fa_warm_up(struct fa_mm *fm, unsigned long ip);
+static void fa_warm_note(unsigned long ip);
+
 /*
  * Sleepable part of the #UD handler. Returns with regs->ip either pointing
  * at a translation or unchanged; in the latter case the instruction is
@@ -1647,6 +1709,8 @@ static void fa_slow(struct pt_regs *regs)
 	struct fa_insn in;
 	struct fa_tr *tr;
 	u8 buf[16];
+	u64 t0 = ktime_get_ns();
+	bool noted = false;
 	int n;
 
 	stat_slow++;
@@ -1665,8 +1729,10 @@ static void fa_slow(struct pt_regs *regs)
 
 	mutex_lock(&fm->lock);
 	n = fa_read_insn(ip, buf);
-	if (!n || buf[0] == 0xe9)
-		goto out;	/* unreadable, or patched in the meantime */
+	if (!n)
+		goto out;	/* unreadable */
+	if (buf[0] == 0xe9)
+		goto setup;	/* patched in the meantime: the jump runs, the stub needs %gs */
 
 	tr = xa_load(&fm->tr, ip);
 	if (!tr || n < tr->len || memcmp(buf, tr->bytes, tr->len)) {
@@ -1694,11 +1760,31 @@ static void fa_slow(struct pt_regs *regs)
 			}
 			goto out;
 		}
+		/*
+		 * This file's known sites first, ip among them, most likely. They
+		 * may have changed ip: patched (just run the jump), or rewritten as
+		 * an evicted neighbor (its record says so). Anything else must
+		 * still match a record exactly, or be translated now.
+		 */
+		if (fa_warm_up(fm, ip)) {
+			n = fa_read_insn(ip, buf);
+			if (!n)
+				goto out;
+			if (buf[0] == 0xe9)
+				goto setup;
+			tr = xa_load(&fm->tr, ip);
+			if (tr && tr->stub && n >= tr->len && !memcmp(buf, tr->bytes, tr->len))
+				goto found;
+			if (fa_decode(buf, n, ip, &in) < 0 || in.kind == FA_K_XGETBV)
+				goto out;	/* changed under us: decide on the next trap */
+		}
 		tr = fa_translate_region(fm, ip, buf, n, 0);
 		if (!tr) {
 			force_sig(SIGILL);
 			goto out;
 		}
+		if (tr->stub)
+			noted = true;
 		if (!tr->stub) {
 			stat_unsupported++;
 			pr_info_ratelimited("%s[%d]: unsupported instruction at %lx: %*ph\n",
@@ -1725,8 +1811,16 @@ found:
 		goto out;
 	}
 	regs->ip = tr->stub;
+	goto out;
+setup:
+	/* ip now jumps into the code cache, whose stubs use this thread's state block */
+	if (!fa_thread_setup(fm) && fm->enabled)
+		force_sig(SIGILL);
 out:
 	mutex_unlock(&fm->lock);
+	if (noted)
+		fa_warm_note(ip);
+	stat_ns_slow += ktime_get_ns() - t0;
 }
 
 static int fa_die(struct notifier_block *nb, unsigned long val, void *data)
@@ -1819,6 +1913,13 @@ static struct notifier_block fa_nb = {
  * FAKEAVX=avx2: a program that can do without AVX is faster on its own SSE
  * code paths than on translated AVX.
  */
+/* What a file looked like when its warm-up sites were recorded (see fa_warm_note()). */
+struct fa_fid {
+	u64 ino, size;
+	s64 sec;
+	u32 nsec;
+};
+
 struct fa_file {
 	struct list_head list;
 	struct inode *inode;
@@ -1826,7 +1927,12 @@ struct fa_file {
 	bool scanned;
 	bool avx;		/* seen executing VEX-encoded instructions */
 	int nsites;
+	struct xarray warm;	/* file offset -> instruction translated on a first trap */
+	int nwarm;
+	struct fa_fid warm_fid;
 };
+
+#define FA_MAX_WARM	16384	/* warm-up sites per file */
 
 struct fa_site {
 	struct list_head list;
@@ -1902,6 +2008,7 @@ static struct fa_file *fa_file_get(struct inode *inode, const char *path)
 	ff = kzalloc(sizeof(*ff), GFP_KERNEL);
 	if (!ff)
 		return NULL;
+	xa_init(&ff->warm);
 	ff->path = kstrdup(path, GFP_KERNEL);
 	ff->inode = igrab(inode);
 	if (!ff->path || !ff->inode) {
@@ -1913,6 +2020,166 @@ static struct fa_file *fa_file_get(struct inode *inode, const char *path)
 	}
 	list_add_tail(&ff->list, &fa_files);
 	return ff;
+}
+
+
+/* ------------------------------------------------------------------ */
+/* Warm-up: a persistent list of translation sites                    */
+
+/*
+ * Every instruction a first trap translates is remembered per file (its
+ * offset). tools/fakeavx-cpuid saves the list with the cpuid sites and gives
+ * it back after a reboot. The first time a process traps in a file with such
+ * a list, all of it is translated and patched at once (fa_warm_up()), so the
+ * process does not trap for each of them, and usually does it while it has
+ * a single thread, when patching needs no IPIs (fa_sync()).
+ *
+ * Only offsets are stored, never code: a bad list can cost time but cannot
+ * put anything into a process. Each offset must still be a translatable
+ * instruction, and a list only applies to the file exactly as it was
+ * recorded (inode, change time, size; the change time cannot be set back,
+ * so any rewrite of the file invalidates it): an offset that is not an
+ * instruction start would otherwise be patched in mid-instruction.
+ */
+static struct fa_fid fa_fid_of(struct inode *inode)
+{
+	struct timespec64 ct = fa_inode_ctime(inode);
+
+	return (struct fa_fid){ inode->i_ino, i_size_read(inode), ct.tv_sec, ct.tv_nsec };
+}
+
+static bool fa_fid_eq(const struct fa_fid *a, const struct fa_fid *b)
+{
+	return a->ino == b->ino && a->size == b->size && a->sec == b->sec && a->nsec == b->nsec;
+}
+
+/* fa_sites_lock held */
+static void fa_warm_add(struct fa_file *ff, const struct fa_fid *fid, u64 off)
+{
+	if (ff->nwarm && !fa_fid_eq(&ff->warm_fid, fid)) {
+		stat_warm_stale += ff->nwarm;	/* the file changed: forget the old list */
+		xa_destroy(&ff->warm);
+		ff->nwarm = 0;
+	}
+	ff->warm_fid = *fid;
+	if (ff->nwarm >= FA_MAX_WARM || off > ULONG_MAX || xa_load(&ff->warm, off))
+		return;
+	if (!xa_err(xa_store(&ff->warm, off, xa_mk_value(1), GFP_KERNEL)))
+		ff->nwarm++;
+}
+
+/* The executable, read-only file mapping at ip: its file (referenced) and load base. */
+static struct file *fa_warm_file(unsigned long ip, unsigned long *base)
+{
+	struct vm_area_struct *vma;
+	struct file *file = NULL;
+
+	mmap_read_lock(current->mm);
+	vma = vma_lookup(current->mm, ip);
+	if (vma && vma->vm_file && (vma->vm_flags & VM_EXEC) &&
+	    !(vma->vm_flags & (VM_WRITE | VM_SHARED))) {
+		file = get_file(vma->vm_file);
+		*base = vma->vm_start - (vma->vm_pgoff << PAGE_SHIFT);
+	}
+	mmap_read_unlock(current->mm);
+	return file;
+}
+
+/* A first trap at ip was translated: remember it. Called without fm->lock. */
+static void fa_warm_note(unsigned long ip)
+{
+	struct fa_file *ff;
+	struct fa_fid fid;
+	unsigned long base;
+	struct file *file = fa_warm_file(ip, &base);
+
+	if (!file)
+		return;
+	fid = fa_fid_of(file_inode(file));
+	mutex_lock(&fa_sites_lock);
+	ff = fa_file_get(file_inode(file), NULL);	/* fa_note_file() made it */
+	if (ff)
+		fa_warm_add(ff, &fid, ip - base);
+	mutex_unlock(&fa_sites_lock);
+	fput(file);
+}
+
+/*
+ * The process traps in this file for the first time: translate every site
+ * on its list. Called with fm->lock held, before ip itself is translated.
+ */
+/* Returns true if it translated anything. */
+static bool fa_warm_up(struct fa_mm *fm, unsigned long ip)
+{
+	struct fa_file *ff;
+	struct fa_fid fid;
+	unsigned long base, idx;
+	struct file *file;
+	struct inode *inode;
+	void *entry;
+	u64 *offs = NULL, t;
+	int n = 0, k, done = 0;
+
+	if (!warm || !patch)
+		return false;
+	file = fa_warm_file(ip, &base);
+	if (!file)
+		return false;
+	inode = file_inode(file);
+	fid = fa_fid_of(inode);
+	mutex_lock(&fa_sites_lock);
+	ff = fa_file_get(inode, NULL);
+	if (ff && ff->nwarm && !xa_load(&fm->warmed, (unsigned long)ff) &&
+	    !xa_err(xa_store(&fm->warmed, (unsigned long)ff, xa_mk_value(1), GFP_KERNEL))) {
+		if (!fa_fid_eq(&ff->warm_fid, &fid)) {
+			stat_warm_stale += ff->nwarm;
+			xa_destroy(&ff->warm);
+			ff->nwarm = 0;
+		} else {
+			offs = kvmalloc_array(ff->nwarm, sizeof(*offs), GFP_KERNEL);
+			if (offs)
+				xa_for_each(&ff->warm, idx, entry)
+					if (n < ff->nwarm)
+						offs[n++] = idx;
+		}
+	}
+	mutex_unlock(&fa_sites_lock);
+
+	t = ktime_get_ns();
+	for (k = 0; k < n; k++) {
+		unsigned long a = base + offs[k];
+		struct vm_area_struct *vma;
+		struct fa_insn in;
+		struct fa_tr *tr;
+		u8 buf[16];
+		bool ok;
+		int len;
+
+		/* still this file, at this offset, and not translated yet */
+		mmap_read_lock(current->mm);
+		vma = vma_lookup(current->mm, a);
+		ok = vma && vma->vm_file && file_inode(vma->vm_file) == inode &&
+		     (vma->vm_flags & VM_EXEC) && !(vma->vm_flags & (VM_WRITE | VM_SHARED)) &&
+		     a - vma->vm_start + (vma->vm_pgoff << PAGE_SHIFT) == offs[k];
+		mmap_read_unlock(current->mm);
+		if (!ok || xa_load(&fm->tr, a))
+			continue;
+		len = fa_read_insn(a, buf);
+		if (!len || fa_decode(buf, len, a, &in) || in.kind == FA_K_XGETBV)
+			continue;
+		tr = fa_translate_region(fm, a, buf, len, 0);
+		if (tr && tr->stub) {
+			stat_warmed++;
+			done++;
+		}
+		if (fatal_signal_pending(current))
+			break;
+		cond_resched();
+	}
+	stat_ns_warm += ktime_get_ns() - t;
+	kvfree(offs);
+	fput(file);
+	return done > 0;
 }
 
 /* fa_sites_lock held */
@@ -1981,6 +2248,7 @@ static void fa_sites_clear(void)
 	}
 	list_for_each_entry_safe(ff, ftmp, &fa_files, list) {
 		list_del(&ff->list);
+		xa_destroy(&ff->warm);
 		iput(ff->inode);
 		kfree(ff->path);
 		kfree(ff);
@@ -2113,6 +2381,7 @@ static void fa_note_file(unsigned long ip, bool vex)
 static int fa_cpuid_site_set(const char *val, const struct kernel_param *kp)
 {
 	unsigned long long off = 0;
+	struct fa_fid wfid = { 0 }, now;
 	struct fa_file *ff;
 	struct path path;
 	char *line, *name;
@@ -2133,6 +2402,16 @@ static int fa_cpuid_site_set(const char *val, const struct kernel_param *kp)
 		kind = 1;
 	} else if (!strcmp(line, "avx")) {
 		kind = 2;
+	} else if (!strncmp(line, "warm:", 5)) {
+		/* warm:OFFSET:INO.SEC.NSEC.SIZE, all hex (fa_sites_show()) */
+		unsigned long long ino, sec, nsec, size;
+
+		kind = 3;
+		if (sscanf(line + 5, "%llx:%llx.%llx.%llx.%llx", &off, &ino, &sec, &nsec, &size) != 5) {
+			ret = -EINVAL;
+			goto out;
+		}
+		wfid = (struct fa_fid){ ino, size, (s64)sec, (u32)nsec };
 	} else {
 		kind = 0;
 		ret = kstrtoull(line, 16, &off);
@@ -2150,7 +2429,13 @@ static int fa_cpuid_site_set(const char *val, const struct kernel_param *kp)
 		ff->scanned = true;
 	else if (kind == 2)
 		ff->avx = true;
-	else
+	else if (kind == 3) {
+		now = fa_fid_of(d_inode(path.dentry));
+		if (fa_fid_eq(&now, &wfid))
+			fa_warm_add(ff, &wfid, off);
+		else
+			stat_warm_stale++;	/* the file changed since: dropped */
+	} else
 		ret = fa_site_add(ff, off);
 	mutex_unlock(&fa_sites_lock);
 	path_put(&path);
@@ -2187,6 +2472,16 @@ static int fa_sites_show(struct seq_file *m, void *v)
 	}
 	list_for_each_entry(st, &fa_sites, list)
 		seq_printf(m, "%llx %s\n", (unsigned long long)st->off, st->ff->path);
+	list_for_each_entry(ff, &fa_files, list) {
+		unsigned long idx;
+		void *entry;
+
+		xa_for_each(&ff->warm, idx, entry)
+			seq_printf(m, "warm:%lx:%llx.%llx.%x.%llx %s\n", idx,
+				   (unsigned long long)ff->warm_fid.ino,
+				   (unsigned long long)ff->warm_fid.sec, ff->warm_fid.nsec,
+				   (unsigned long long)ff->warm_fid.size, ff->path);
+	}
 	mutex_unlock(&fa_sites_lock);
 	return 0;
 }

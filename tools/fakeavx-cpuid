@@ -15,6 +15,11 @@
 #   fakeavx-cpuid save [CACHE]    write the module's list to CACHE
 #   fakeavx-cpuid restore [CACHE] give a saved list back to the module; entries
 #                                 for files that changed since are dropped
+#
+# The list also holds each file's warm-up sites ("warm:OFFSET:ID FILE"): the
+# instructions fakeavx translated on first traps, which it then translates
+# all at once the next time a process starts running that file. They are
+# offsets only, and the module drops them for a file that changed.
 #   fakeavx-cpuid clear           make the module forget everything
 #
 # CACHE defaults to /var/cache/fakeavx/sites.
@@ -62,8 +67,9 @@ list)
 	awk '
 	$1 == "scanned" { sub(/^[^ ]+ /, ""); seen[$0] = 1; next }
 	$1 == "avx" { sub(/^[^ ]+ /, ""); seen[$0] = 1; avx[$0] = 1; next }
+	$1 ~ /^warm:/ { sub(/^[^ ]+ /, ""); seen[$0] = 1; w[$0]++; next }
 	{ sub(/^[^ ]+ /, ""); seen[$0] = 1; n[$0]++ }
-	END { for (p in seen) printf "%5d cpuid sites%s  %s\n", n[p], avx[p] ? ", reports AVX" : "", p }' "$PROC"
+	END { for (p in seen) printf "%5d cpuid sites, %5d warm-up sites%s  %s\n", n[p], w[p], avx[p] ? ", reports AVX" : "", p }' "$PROC"
 	;;
 scan)
 	[ -f "$2" ] || { echo "usage: $0 scan FILE" >&2; exit 1; }
@@ -108,13 +114,16 @@ restore)
 		[ "$kind" = stat ] || continue
 		[ -f "$path" ] && [ "$(stat -c '%s.%Y' "$path")" = "$sig" ] && printf '%s\n' "$path" >> "$valid"
 	done < "$CACHE"
+	# the entries of unchanged files, in one pass (there can be thousands)
+	lines=$(mktemp)
+	trap 'rm -f "$valid" "$lines"' EXIT
+	awk 'NR == FNR { ok[$0] = 1; next }
+	     /^stat / { next }
+	     { p = $0; sub(/^[^ ]* /, "", p); if (p in ok) print }' "$valid" "$CACHE" > "$lines"
 	n=0
 	while IFS= read -r line; do
-		case "$line" in stat\ *) continue ;; esac
-		if grep -Fxq -- "${line#* }" "$valid"; then
-			write_param cpuid_site "$line" && n=$((n + 1))
-		fi
-	done < "$CACHE"
+		write_param cpuid_site "$line" && n=$((n + 1))
+	done < "$lines"
 	echo "fakeavx: $n cached entries restored"
 	;;
 clear)

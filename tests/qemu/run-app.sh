@@ -50,7 +50,7 @@ i=0; while [ \$i -lt ${RUNS:-1} ]; do i=\$((i+1))
 echo "=== run \$i"
 ${FAKEAVX:+FAKEAVX=$FAKEAVX }$cmd; echo "exit status \$?"
 done
-echo "=== /proc/fakeavx/sites: \$(\$B grep -c . /proc/fakeavx/sites) lines"; \$B grep -v "^[0-9a-f]* " /proc/fakeavx/sites
+echo "=== /proc/fakeavx/sites: \$(\$B grep -c . /proc/fakeavx/sites) lines"; \$B grep -v -e "^[0-9a-f]* " -e "^warm:" /proc/fakeavx/sites
 echo "=== stats"
 for f in /sys/module/fakeavx/parameters/stat_*; do echo "\$(\$B basename \$f) \$(\$B cat \$f)"; done
 \$B dmesg | \$B grep -i -E 'fakeavx|BUG|WARNING|Oops|sleeping|scheduling while|segfault|traps:' | \$B tail -25

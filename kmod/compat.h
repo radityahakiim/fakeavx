@@ -45,4 +45,12 @@
 #define FA_UPROBE_DATA_ARG
 #endif
 
+/* inode_get_ctime() since 6.6; i_ctime before */
+#include <linux/fs.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#define fa_inode_ctime(inode)	inode_get_ctime(inode)
+#else
+#define fa_inode_ctime(inode)	((inode)->i_ctime)
+#endif
+
 #endif
