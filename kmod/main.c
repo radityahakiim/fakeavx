@@ -77,6 +77,11 @@ static bool warm = true;
 module_param(warm, bool, 0644);
 MODULE_PARM_DESC(warm, "translate a file's known sites all at once at its first trap in a process (default on)");
 
+static bool lazy = true;
+module_param(lazy, bool, 0644);
+MODULE_PARM_DESC(lazy, "give the other AVX instructions of a region an entry only once they are "
+		 "entered directly (default on)");
+
 static bool force;
 module_param(force, bool, 0444);
 MODULE_PARM_DESC(force, "load even if the CPU already supports AVX (for testing only)");
@@ -84,8 +89,9 @@ MODULE_PARM_DESC(force, "load even if the CPU already supports AVX (for testing 
 static unsigned long stat_fast, stat_slow, stat_translated, stat_patched, stat_patched_short,
 	stat_patched_int, stat_regions, stat_regions_borrowing, stat_unsupported,
 	stat_short_refused, stat_unpatched, stat_diverted, stat_evicted, stat_evicted_int,
-	stat_evict_traps, stat_evict_undone;
+	stat_evict_traps, stat_evict_undone, stat_lazy;
 module_param(stat_fast, ulong, 0444);
+module_param(stat_lazy, ulong, 0444);
 module_param(stat_slow, ulong, 0444);
 module_param(stat_translated, ulong, 0444);
 module_param(stat_patched, ulong, 0444);
@@ -181,6 +187,9 @@ struct fa_mm {
 	u8 *buf;			/* FA_BODY_MAX bytes */
 	struct fa_rgn *rg;
 	struct xarray warmed;		/* struct fa_file * -> files warmed up in this process */
+	const u64 *warm_offs;		/* during fa_warm_up(): its sites (file offsets), ascending */
+	int warm_n;
+	unsigned long warm_base;	/* their file's load address */
 };
 
 static DEFINE_HASHTABLE(fa_mms, 8);
@@ -1498,6 +1507,25 @@ static bool fa_is_ours(unsigned long ip)
 	return n && !fa_decode(buf, n, ip, &in) && in.kind != FA_K_XGETBV;
 }
 
+/* Is ip one of the sites fa_warm_up() is translating? */
+static bool fa_warm_known(struct fa_mm *fm, unsigned long ip)
+{
+	u64 o = ip - fm->warm_base;
+	int lo = 0, hi = fm->warm_n;
+
+	while (lo < hi) {
+		int mid = lo + (hi - lo) / 2;
+
+		if (fm->warm_offs[mid] == o)
+			return true;
+		if (fm->warm_offs[mid] < o)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return false;
+}
+
 /* Does the first block of the region run straight from its entry into ip? */
 static bool fa_rgn_reaches(const struct fa_rgn *rg, unsigned long ip)
 {
@@ -1527,6 +1555,16 @@ static bool fa_rgn_reaches(const struct fa_rgn *rg, unsigned long ip)
  * only checked against the bytes of the instruction it starts at (its record),
  * and a JIT rewrites code in place: a region would keep running its copy of
  * the instructions after that one when they change (tests/guest/jit_test).
+ *
+ * The region's other AVX instructions run in it whenever it is entered at
+ * ip, so their entries (stub, record, patch) are only for being entered
+ * directly, from outside the region; most never are. With lazy they get
+ * none: one that is entered that way traps then, and gets a region of its
+ * own, its address recorded in the warm-up list. Entries are made where they
+ * are known to be needed: ip, the warm-up list's other sites (while it is
+ * translated), and what a short instruction with an entry needs after it -
+ * the next instruction's final bytes for its jump's displacement, or its
+ * record to evict it (see fa_make_entry()).
  */
 static struct fa_tr *fa_translate_region(struct fa_mm *fm, unsigned long ip,
 					 const u8 *buf, int nread, unsigned long via)
@@ -1537,6 +1575,7 @@ static struct fa_tr *fa_translate_region(struct fa_mm *fm, unsigned long ip,
 	struct fa_region *main = fa_region_get(fm, ip);
 	struct fa_rgn *rg = fm->rg;
 	u8 order[FA_RG_ITEMS];
+	bool need[FA_RG_ITEMS];		/* gets an entry now */
 	unsigned long addr, fresh = via ? 0 : ip;	/* gets an entry even if known */
 	bool single = !fa_patchable(fm, ip, 1);
 	int i, j, cand, ret = -1;
@@ -1575,6 +1614,17 @@ static struct fa_tr *fa_translate_region(struct fa_mm *fm, unsigned long ip,
 	if (rg->has_map)
 		stat_regions_borrowing++;
 
+	/* successors follow in it[] (fa_ev_next()), so one pass carries a chain */
+	for (i = 0; i < rg->n; i++) {
+		const struct fa_ritem *it = &rg->it[i];
+
+		need[i] = it->kind == FA_R_OURS &&
+			  (!lazy || it->ip == fresh || (fm->warm_n && fa_warm_known(fm, it->ip)));
+		if (i && need[i - 1] && rg->it[i - 1].len < 5 && !rg->it[i - 1].has_link &&
+		    rg->it[i - 1].ip + rg->it[i - 1].len == it->ip && it->kind == FA_R_OURS)
+			need[i] = true;
+	}
+
 	/*
 	 * Highest address first: an instruction too short for a 5-byte jump
 	 * borrows displacement bytes from the one after it, which therefore
@@ -1591,6 +1641,10 @@ static struct fa_tr *fa_translate_region(struct fa_mm *fm, unsigned long ip,
 
 		if (it->kind != FA_R_OURS || (it->ip != fresh && xa_load(&fm->tr, it->ip)))
 			continue;
+		if (!need[order[i]]) {
+			stat_lazy++;
+			continue;
+		}
 		if (it->len < 5 && !xa_load(&fm->tr, it->ip + it->len) &&
 		    fa_is_ours(it->ip + it->len)) {
 			/* its successor is not settled yet: leave it for a later trap */
@@ -1620,6 +1674,8 @@ static struct fa_tr *fa_translate_region(struct fa_mm *fm, unsigned long ip,
 			continue;
 		}
 		tr = xa_load(&fm->tr, it->ip);
+		if (!tr && !need[i])
+			continue;	/* lazy: it traps when entered directly, if ever */
 		if (cand >= 0 && (!tr || (tr->stub && tr->bytes[0] != 0xe9))) {
 			tr = fa_make_entry(fm, main, rg, &rg->it[cand], true);
 			if (tr && tr->bytes[0] == 0xe9)
@@ -2156,6 +2212,9 @@ static bool fa_warm_up(struct fa_mm *fm, unsigned long ip)
 	mutex_unlock(&fa_sites_lock);
 
 	t = ktime_get_ns();
+	fm->warm_offs = offs;	/* ascending: xa_for_each() */
+	fm->warm_n = n;
+	fm->warm_base = base;
 	for (k = 0; k < n; k++) {
 		unsigned long a = base + offs[k];
 		struct vm_area_struct *vma;
@@ -2186,6 +2245,8 @@ static bool fa_warm_up(struct fa_mm *fm, unsigned long ip)
 			break;
 		cond_resched();
 	}
+	fm->warm_n = 0;
+	fm->warm_offs = NULL;
 	stat_ns_warm += ktime_get_ns() - t;
 	kvfree(offs);
 	fput(file);

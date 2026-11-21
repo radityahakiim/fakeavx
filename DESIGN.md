@@ -408,9 +408,22 @@ along if `core/intdec.c` recognises them exactly (a whitelist, checked against
 Capstone); anything else ends the block there. `call`, `ret` and indirect jumps
 always end a block, so return addresses stay the original ones.
 
-Each AVX instruction of the region gets an entry stub and, if possible, a
-patch, as before; several regions may cover the same instruction, the first
-one wins.
+The trapping instruction gets an entry stub and, if possible, a patch, as
+before. The region's other AVX instructions run in it whenever it is entered
+there, so their entries are only for being entered directly, from outside it;
+in `fakeavx-prof` none of 9,615 such instructions ever was, in Claude Code one
+of 73. They first got entries all the same, which was three quarters of the
+writes to memory of a first execution (26,316 pokes for `fakeavx-prof`,
+6,020 without them). Now they are lazy (module parameter `lazy`): one entered
+directly traps then and gets a region of its own, and its file's warm-up list
+records it. Entries are still made up front for the warm-up list's sites,
+while it is being translated, and for what a short instruction with an entry
+needs after it: the next instruction's final bytes, which its jump's
+displacement takes, or that instruction's record, to evict it
+(`tests/evict_test` caught the latter: a lazy successor cannot be evicted,
+nor its jump given back). Several regions may cover the same instruction;
+the first one with an entry for it wins. Launching a program with 4,096 AVX
+functions (KVM guest): 76-82 ms to 52 ms cold, 46 ms to 24 ms warmed up.
 
 **Borrowed registers (O5).** If the region has a backward edge, XMM registers
 that none of its instructions name are borrowed: two as scratch (so
